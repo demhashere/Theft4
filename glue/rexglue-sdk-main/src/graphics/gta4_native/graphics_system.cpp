@@ -424,6 +424,10 @@ REXCVAR_DEFINE_UINT32(
     gta4_native_texture_memory_limit_mb, 0, "GTA IV/Graphics/Native Renderer",
     "Optional native texture heap budget cap in MiB (0 uses the Vulkan driver budget)");
 REXCVAR_DEFINE_BOOL(
+    gta4_native_unified_upload_planning, false, "GTA IV/Graphics/Native Renderer",
+    "On unified-memory drivers, skip planning frame staging space for persistent vertex and "
+    "index buffers, which are filled through their own mapping (as on MoltenVK)");
+REXCVAR_DEFINE_BOOL(
     gta4_native_host_memory_budget, false, "GTA IV/Graphics/Native Renderer",
     "Without VK_EXT_memory_budget (Honeykrisp), derive the texture budget from host "
     "MemAvailable; under that pressure, textures unused for "
@@ -17872,8 +17876,15 @@ bool Gta4NativeGraphicsSystem::EnsureFrameUploadCapacity(
   std::set<VertexUploadKey> pending_vertex_uploads;
   std::set<std::pair<const NativeBufferResource*, bool>> pending_index_uploads;
   const bool persistent_buffers_enabled = REXCVAR_GET(gta4_native_persistent_buffers);
-  const bool persistent_direct_upload =
-      persistent_buffers_enabled && vulkan_device->properties().driverID == VK_DRIVER_ID_MOLTENVK;
+  // Persistent blocks prefer a device-local, host-visible type and are then
+  // filled by memcpy, never through this staging arena (MoltenVK always; any
+  // unified-memory driver such as Honeykrisp too). A rare unplanned staging
+  // fallback grows an overflow block in AllocateUpload.
+  const auto& upload_memory_types = vulkan_device->memory_types();
+  const bool unified_persistent_blocks = REXCVAR_GET(gta4_native_unified_upload_planning) &&
+      (upload_memory_types.device_local & upload_memory_types.host_visible) != 0;
+  const bool persistent_direct_upload = persistent_buffers_enabled &&
+      (vulkan_device->properties().driverID == VK_DRIVER_ID_MOLTENVK || unified_persistent_blocks);
   const bool sparse_texture_walks = REXCVAR_GET(gta4_native_sparse_texture_walks);
   uint32_t draw_count = 0;
   for (const NativeCommand& command : current_frame_) {
