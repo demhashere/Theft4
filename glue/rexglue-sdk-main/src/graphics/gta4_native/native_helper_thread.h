@@ -92,6 +92,10 @@ class NativeHelperThread {
 
   static uint32_t OnlineCpus() {
 #if defined(__linux__)
+    // CPUs this process may run on (taskset/cgroup cpusets), else all online.
+    cpu_set_t allowed;
+    if (sched_getaffinity(0, sizeof(allowed), &allowed) == 0 && CPU_COUNT(&allowed) > 0)
+      return uint32_t(CPU_COUNT(&allowed));
     const long online = sysconf(_SC_NPROCESSORS_ONLN);
     if (online > 0) return uint32_t(std::min<long>(online, 1024));
 #endif
@@ -106,24 +110,28 @@ class NativeHelperThread {
   static bool PinToPerformanceCores() {
     const char* setting = std::getenv("THEFT4_HELPER_AFFINITY");
     if (!setting || std::strcmp(setting, "performance") != 0) return false;
+    // CPUs without a readable capacity (gaps, no topology) are skipped.
     uint32_t capacities[CPU_SETSIZE] = {};
     uint32_t highest = 0, lowest = UINT32_MAX, count = 0;
-    for (uint32_t cpu = 0; cpu < CPU_SETSIZE; ++cpu, ++count) {
+    const long configured = std::min<long>(sysconf(_SC_NPROCESSORS_CONF), CPU_SETSIZE);
+    for (long cpu = 0; cpu < configured; ++cpu) {
       char path[64], text[32] = {};
-      std::snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%u/cpu_capacity", cpu);
+      std::snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%ld/cpu_capacity", cpu);
       const int fd = open(path, O_RDONLY | O_CLOEXEC);
-      if (fd < 0) break;
+      if (fd < 0) continue;
       const ssize_t size = read(fd, text, sizeof(text) - 1);
       close(fd);
-      if (size <= 0) break;
+      if (size <= 0) continue;
       capacities[cpu] = uint32_t(std::strtoul(text, nullptr, 10));
+      if (!capacities[cpu]) continue;
       highest = std::max(highest, capacities[cpu]);
       lowest = std::min(lowest, capacities[cpu]);
+      ++count;
     }
     if (!count || highest == lowest) return false;  // symmetric or unknown topology
     cpu_set_t set;
     CPU_ZERO(&set);
-    for (uint32_t cpu = 0; cpu < count; ++cpu)
+    for (long cpu = 0; cpu < configured; ++cpu)
       if (capacities[cpu] == highest) CPU_SET(cpu, &set);
     return sched_setaffinity(0, sizeof(set), &set) == 0;
   }
