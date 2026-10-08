@@ -34,6 +34,14 @@ if(NOT _VCPKG_LINUX_CLANG_TOOLCHAIN)
     set(CMAKE_CXX_COMPILER clang++)
     SET(CMAKE_ASM_COMPILER clang)
 
+    # VCPKG_TARGET_ARCHITECTURE only exists while vcpkg builds its ports; the
+    # top-level project configure only has the triplet. Without this the main
+    # build has an empty CMAKE_SYSTEM_PROCESSOR, so architecture checks fail
+    # (e.g. FFmpeg's aarch64 sources are left out on arm64).
+    if(NOT DEFINED VCPKG_TARGET_ARCHITECTURE AND VCPKG_TARGET_TRIPLET MATCHES "^(x64|x86|arm64|arm)-")
+        set(VCPKG_TARGET_ARCHITECTURE "${CMAKE_MATCH_1}")
+    endif()
+
     # Pick target architecture for clang
     if(VCPKG_TARGET_ARCHITECTURE STREQUAL "x64")
         set(CMAKE_SYSTEM_PROCESSOR x86_64 CACHE STRING "")

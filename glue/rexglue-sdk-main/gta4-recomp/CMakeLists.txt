@@ -267,6 +267,108 @@ if(APPLE AND LIBERTY_RECOMP_TARGET_PLATFORM STREQUAL "desktop")
             "$<TARGET_BUNDLE_DIR:LibertyRecomp>" --arch "${CMAKE_OSX_ARCHITECTURES}"
         COMMENT "Verifying macOS runtime closure, architecture, minimum OS, and signature..."
         VERBATIM)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND LIBERTY_RECOMP_TARGET_PLATFORM STREQUAL "desktop")
+    # Linux desktop: the same Graine consumer as macOS, without the bundle,
+    # signing and Apple frameworks. The Objective-C++ platform services are
+    # replaced by src/platform_services_linux.cpp. Resources are looked up in
+    # <executable folder>/../Resources as in the macOS bundle.
+    find_package(CURL REQUIRED)
+    find_package(OpenSSL 3.0 REQUIRED COMPONENTS Crypto)
+
+    set(LIBERTY_BUTTON_PROMPT_SOURCE
+        "${LIBERTY_RECOMP_WORKSPACE_ROOT}/LibertyRecompLib/private/button_prompts")
+    set(LIBERTY_RPF_AES_KEY_SOURCE
+        "${LIBERTY_RECOMP_WORKSPACE_ROOT}/LibertyRecompLib/aes_key.bin")
+
+    add_executable(LibertyRecomp
+        src/main.cpp
+        src/gta4_app.cpp
+        src/gta4_frontend_hooks.cpp
+        src/gta4_font_selection_trace.cpp
+        src/gta4_presentation_options.cpp
+        src/gta4_presentation_hooks.cpp
+        src/gta4_aspect_hooks.cpp
+        src/gta4_quicksave_hooks.cpp
+        src/gta4_input_hooks.cpp
+        src/gta4_loading_parallax_fix.cpp
+        src/gta4_motion_bridge.cpp
+        src/gta4_motion_hooks.cpp
+        src/gta4_motion_vehicle_hooks.cpp
+        src/gta4_audio_lifetime_trace.cpp
+        src/gta4_lzx_hooks.cpp
+        src/gta4_multiplayer_64_hooks.cpp
+        src/gta4_online_hooks.cpp
+        src/gta4_native_hooks.cpp
+        src/gta4_population_hooks.cpp
+        src/gta4_streaming_diagnostics.cpp
+        src/gta4_touch_coordinator.cpp
+        src/gta4_transition_hooks.cpp
+        src/install/gta4_install_dialog.cpp
+        src/install/gta4_installer.cpp
+        src/install/gta4_rpf_extractor.cpp
+        src/install/gta4_source_inspector.cpp
+        src/legal_screen_trace.cpp
+        src/rpf_button_prompts.cpp
+        src/platform_services_linux.cpp
+        src/input/text_chat_dialog.cpp
+        src/input/context_touch_controls.cpp
+        src/input/context_touch_layout.cpp
+        src/input/context_touch_overlay.cpp
+        src/network/community_multiplayer.cpp
+        src/network/gta4_voice_audio.cpp
+        "${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/crypto/rijndael-alg-fst.c"
+        ${GENERATED_SOURCES}
+    )
+
+    target_include_directories(LibertyRecomp PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/generated
+        ${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/crypto
+        ${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/imgui
+        ${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/inja/third_party/include
+    )
+
+    target_compile_definitions(LibertyRecomp PRIVATE
+        GTA4_RECOMP_ASSET_XEX="${CMAKE_CURRENT_SOURCE_DIR}/assets/default_v8.xex"
+        GTA4_BUTTON_PROMPT_ASSET_ROOT="${LIBERTY_BUTTON_PROMPT_SOURCE}"
+        GTA4_RPF_AES_KEY_SOURCE="${LIBERTY_RPF_AES_KEY_SOURCE}"
+    )
+
+    target_link_libraries(LibertyRecomp PRIVATE
+        rex::runtime
+        xxHash::xxhash
+        CURL::libcurl
+        OpenSSL::Crypto
+        SDL3::SDL3
+        utf8cpp
+        z
+    )
+
+    rexglue_configure_target(LibertyRecomp GPU_PLUGINS xenos gta4-native)
+
+    # This directory sits outside the SDK, so the SDK's global compile options
+    # do not reach it. The generated guest code needs the same strict FP and
+    # aliasing rules as the iOS game-code target (and the SDK's char8_t mode).
+    target_compile_options(LibertyRecomp PRIVATE
+        -fno-strict-aliasing -ffp-model=strict -fno-char8_t)
+
+    # The gta4-native renderer is maintained in its Lab configuration (the iOS
+    # default): its command recycling, retained commands and worker batches are
+    # only compiled with THEFT4_LAB_BUILD. As on iOS, the app and its generated
+    # game code (whose collision watchdog includes LibertyRecomp/patches/
+    # relative to the workspace root) receive it too, as does rexruntime.
+    target_compile_definitions(LibertyRecomp PRIVATE THEFT4_LAB_BUILD=1)
+    target_include_directories(LibertyRecomp PRIVATE "${LIBERTY_RECOMP_WORKSPACE_ROOT}")
+    foreach(_liberty_lab_target rexgpu-gta4-native rexruntime)
+        if(TARGET ${_liberty_lab_target})
+            target_compile_definitions(${_liberty_lab_target} PRIVATE THEFT4_LAB_BUILD=1)
+        endif()
+    endforeach()
+
+    set_target_properties(LibertyRecomp PROPERTIES
+        OUTPUT_NAME "LibertyRecomp"
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/LibertyRecomp/bin"
+    )
 else()
     add_library(gta4_recomp INTERFACE)
     target_include_directories(gta4_recomp INTERFACE

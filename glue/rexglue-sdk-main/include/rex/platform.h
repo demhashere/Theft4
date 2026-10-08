@@ -92,6 +92,17 @@
 #define REX_ARCH_PPC 1
 #endif
 
+// The 0xE0000000 guest heap views physical memory at a 4 KB offset. Hosts whose
+// mapping granularity can exceed 4 KB (Windows, Apple Silicon, arm64 Linux with
+// 16K/64K pages) map that view at the rounded-down file offset and add the 4 KB
+// on every access instead. Generated code (REX_PHYS_HOST_OFFSET), GuestPtr and
+// the memory runtime must all follow this one switch.
+#if REX_PLATFORM_WIN32 || REX_PLATFORM_DARWIN || (REX_PLATFORM_LINUX && REX_ARCH_ARM64)
+#define REX_EMULATED_PHYS_HOST_OFFSET 1
+#else
+#define REX_EMULATED_PHYS_HOST_OFFSET 0
+#endif
+
 #if REX_PLATFORM_WIN32
 #include <intrin.h>
 #elif REX_ARCH_AMD64

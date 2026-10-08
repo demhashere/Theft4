@@ -14,6 +14,10 @@
 
 #include <xcb/xcb.h>
 
+struct SDL_Window;
+struct wl_display;
+struct wl_surface;
+
 namespace rex {
 namespace ui {
 
@@ -31,6 +35,25 @@ class XcbWindowSurface final : public Surface {
  private:
   xcb_connection_t* connection_;
   xcb_window_t window_;
+};
+
+// Native Wayland toplevel owned by SDL. Wayland has no geometry query, so the
+// size comes from SDL in physical pixels (the window uses high pixel density).
+class WaylandWindowSurface final : public Surface {
+ public:
+  WaylandWindowSurface(SDL_Window* sdl_window, wl_display* display, wl_surface* surface)
+      : sdl_window_(sdl_window), display_(display), surface_(surface) {}
+  TypeIndex GetType() const override { return kTypeIndex_WaylandWindow; }
+  wl_display* display() const { return display_; }
+  wl_surface* surface() const { return surface_; }
+
+ protected:
+  bool GetSizeImpl(uint32_t& width_out, uint32_t& height_out) const override;
+
+ private:
+  SDL_Window* sdl_window_;
+  wl_display* display_;
+  wl_surface* surface_;
 };
 
 }  // namespace ui

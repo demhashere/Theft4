@@ -282,6 +282,7 @@ constexpr std::array kAntiAliasingChoices = {
 constexpr std::array kUpscalerChoices = {
     Choice{"native", TextId::kNative},
     Choice{"fsr1", TextId::kFsr1},
+    Choice{"bilinear", TextId::kBilinear},
 };
 constexpr std::array kFsrQualityChoices = {
     Choice{"ultra_quality", TextId::kUltraQuality},

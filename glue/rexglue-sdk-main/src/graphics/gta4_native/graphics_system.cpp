@@ -20,6 +20,7 @@
 #include <cerrno>
 #endif
 #include "native_cpu_profile_scope.h"
+#include "native_pass_stats.h"
 #include "native_profile_shader_category.h"
 #include "modern_shader_options.h"
 #ifdef THEFT4_BC_TEXTURE_COMPATIBILITY
@@ -197,6 +198,17 @@ REXCVAR_DEFINE_BOOL(gta4_native_async_pipeline_no_wait, false,
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(gta4_trace_vector_fonts, true, "GTA IV/Diagnostics",
                     "Log the guest-to-Vulkan vector-font data path with bounded draw details");
+REXCVAR_DEFINE_BOOL(gta4_native_test_skip_draws, false, "GTA IV/Diagnostics",
+                    "Test only: reject every draw pipeline, so the title runs with no "
+                    "rendered geometry (isolates renderer effects on other subsystems)");
+REXCVAR_DEFINE_BOOL(gta4_native_triangle_fans, true, "GTA IV/Graphics/Native Renderer",
+                    "Draw triangle-fan primitives on drivers that support them. Disabling "
+                    "skips the title's depth-only visibility draws and stalls cutscenes");
+REXCVAR_DEFINE_BOOL(gta4_native_guest_texture_view_swizzle, false,
+                    "GTA IV/Graphics/Native Renderer",
+                    "Apply the guest fetch-constant swizzle in sampled texture views on drivers "
+                    "that support view swizzles. Off matches the shipped MoltenVK identity-view "
+                    "policy; on swaps red and blue on ARGB textures such as lights and sparks");
 REXCVAR_DEFINE_BOOL(gta4_native_spatial_aa, true, "GTA IV/Graphics/Anti-Aliasing",
                     "Legacy compatibility toggle for the native spatial edge resolve");
 REXCVAR_DEFINE_BOOL(gta4_native_output_dither, true, "GTA IV/Graphics/Post-Processing",
@@ -242,6 +254,10 @@ REXCVAR_DEFINE_BOOL(
 REXCVAR_DEFINE_BOOL(
     gta4_native_component_scope_reuse, false, "GTA IV/Graphics/Native Renderer",
     "Keep compatible single-sample draw scopes across component write-mask changes");
+REXCVAR_DEFINE_BOOL(
+    gta4_native_superset_scope_reuse, true, "GTA IV/Graphics/Native Renderer",
+    "Keep a single-sample draw scope when a draw needs only a subset of its attachments, such "
+    "as GTA IV's stencil-only light setup draws; avoids per-light scope breaks on tiled GPUs");
 REXCVAR_DEFINE_STRING(
     gta4_native_light_overrides, "pair", "GTA IV/Graphics/Native Renderer",
     "Shader override selection: stock modules, legacy stage selection, or approved pipeline pairs")
@@ -3523,7 +3539,13 @@ VkFormat ConvertTextureFormat(xenos::TextureFormat format) {
     case xenos::TextureFormat::k_32_32_FLOAT:
       return VK_FORMAT_R32G32_SFLOAT;
     case xenos::TextureFormat::k_24_8:
+#if REX_PLATFORM_LINUX
+      // Honeykrisp (Apple GPUs) has no D24S8; the scene depth targets these
+      // are resolved from are D32S8 already, which a copy also requires.
+      return VK_FORMAT_D32_SFLOAT_S8_UINT;
+#else
       return VK_FORMAT_D24_UNORM_S8_UINT;
+#endif
     case xenos::TextureFormat::k_24_8_FLOAT:
       return VK_FORMAT_D32_SFLOAT_S8_UINT;
     default:
@@ -8553,6 +8575,85 @@ bool Gta4NativeGraphicsSystem::InitializeShaderCache() {
   return true;
 }
 
+namespace {
+
+// The usage->location table spans locations 0..39, but Vulkan only guarantees
+// 16 vertex input locations, which is all Honeykrisp exposes (MoltenVK has 31).
+// Renumber a vertex shader's inputs densely in location order and patch its
+// modules to match. Declaration matching keeps using the original location.
+bool PatchVertexInputLocations(std::vector<uint32_t>& spirv,
+                               const std::vector<std::pair<uint32_t, uint32_t>>& remap) {
+  if (spirv.size() < 5 || !spirv[3]) {
+    return false;
+  }
+  const uint32_t id_bound = spirv[3];
+  std::vector<bool> inputs(id_bound, false);
+  for (size_t cursor = 5; cursor < spirv.size();) {
+    const uint32_t word_count = spirv[cursor] >> 16;
+    if (!word_count || word_count > spirv.size() - cursor) {
+      return false;
+    }
+    const uint32_t* words = spirv.data() + cursor;
+    if (spv::Op(words[0] & 0xFFFFu) == spv::Op::OpVariable && word_count >= 4 &&
+        words[2] < id_bound && words[3] == uint32_t(spv::StorageClass::Input)) {
+      inputs[words[2]] = true;
+    }
+    cursor += word_count;
+  }
+  for (size_t cursor = 5; cursor < spirv.size();) {
+    const uint32_t word_count = spirv[cursor] >> 16;
+    uint32_t* words = spirv.data() + cursor;
+    if (spv::Op(words[0] & 0xFFFFu) == spv::Op::OpDecorate && word_count >= 4 &&
+        words[1] < id_bound && inputs[words[1]] &&
+        spv::Decoration(words[2]) == spv::Decoration::Location) {
+      const auto entry = std::find_if(remap.begin(), remap.end(),
+                                      [&](const auto& pair) { return pair.first == words[3]; });
+      if (entry == remap.end()) {
+        return false;
+      }
+      words[3] = entry->second;
+    }
+    cursor += word_count;
+  }
+  return true;
+}
+
+template <typename VertexInput>
+bool CompactNativeVertexInputLocations(std::vector<VertexInput>& inputs,
+                                       std::array<std::vector<uint32_t>, 4>& code) {
+  constexpr uint32_t kGuaranteedVertexInputLocations = 16;
+  uint32_t max_location = 0;
+  for (auto& input : inputs) {
+    input.host_location = input.location;
+    max_location = std::max(max_location, input.location);
+  }
+  if (inputs.empty() || max_location < kGuaranteedVertexInputLocations) {
+    return true;
+  }
+  std::vector<uint32_t> sorted;
+  for (const auto& input : inputs) {
+    sorted.push_back(input.location);
+  }
+  std::sort(sorted.begin(), sorted.end());
+  sorted.erase(std::unique(sorted.begin(), sorted.end()), sorted.end());
+  std::vector<std::pair<uint32_t, uint32_t>> remap;
+  for (uint32_t index = 0; index < sorted.size(); ++index) {
+    remap.emplace_back(sorted[index], index);
+  }
+  for (auto& input : inputs) {
+    input.host_location = uint32_t(
+        std::lower_bound(sorted.begin(), sorted.end(), input.location) - sorted.begin());
+  }
+  for (auto& module : code) {
+    if (!module.empty() && !PatchVertexInputLocations(module, remap)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+}  // namespace
+
 bool Gta4NativeGraphicsSystem::ReflectVertexInputs(const std::vector<uint32_t>& spirv,
                                                    std::vector<NativeVertexInput>& inputs) {
   inputs.clear();
@@ -9075,6 +9176,12 @@ Gta4NativeGraphicsSystem::PrepareNativeShader(
 
   prepared->code[0] = std::move(stock_early_spirv);
   prepared->code[1] = std::move(stock_late_spirv);
+  if (command.stage == ShaderStage::kVertex &&
+      !CompactNativeVertexInputLocations(resource->vertex_inputs, prepared->code)) {
+    REXLOG_ERROR("gta4-native: failed to compact vertex input locations for shader {}",
+                 resource->filename);
+    return nullptr;
+  }
   prepared->shader = std::move(resource);
   return prepared;
 }
@@ -18346,9 +18453,11 @@ bool Gta4NativeGraphicsSystem::PrepareNativeTextureDescription(
     view_info.components.b = VK_COMPONENT_SWIZZLE_ONE;
     view_info.components.a = VK_COMPONENT_SWIZZLE_R;
   } else if (capabilities.portability_subset ||
-             !capabilities.image_view_format_swizzle) {
+             !capabilities.image_view_format_swizzle ||
+             !REXCVAR_GET(gta4_native_guest_texture_view_swizzle)) {
     // Ordinary native portability views deliberately retain the established
-    // identity policy even when font-only swizzle support is enabled.
+    // identity policy even when font-only swizzle support is enabled. Other
+    // drivers follow the same policy unless the guest swizzle cvar is set.
     host_swizzle = xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA;
     view_info.components = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
                             VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
@@ -21787,7 +21896,7 @@ Gta4NativeGraphicsSystem::PrepareNativePipelineDescription(
   }
   attributes.reserve(state.vertex_shader_resource->vertex_inputs.size());
   for (const NativeVertexInput& shader_input : state.vertex_shader_resource->vertex_inputs) {
-    if (shader_input.location >= vertex_limits.maxVertexInputAttributes) {
+    if (shader_input.host_location >= vertex_limits.maxVertexInputAttributes) {
       return reject("vertex-input-location-limit");
     }
     const VertexElement* matching_element = nullptr;
@@ -21800,7 +21909,7 @@ Gta4NativeGraphicsSystem::PrepareNativePipelineDescription(
     }
 
     VkVertexInputAttributeDescription attribute{};
-    attribute.location = shader_input.location;
+    attribute.location = shader_input.host_location;
     if (!matching_element) {
       attribute.binding = kDefaultVertexBinding;
       attribute.format =
@@ -22142,6 +22251,7 @@ bool Gta4NativeGraphicsSystem::PrepareNativePipelineKey(
     const NativePipelineCapabilities& capabilities, const ShaderOverrideSelection& shader_selection,
     NativePipelineKey& key, std::string& error) const {
   const auto reject = [&](const char* reason) { error = reason; return false; };
+  if (REXCVAR_GET(gta4_native_test_skip_draws)) return reject("test-skip-draws");
   const bool has_color_target = target.color_attachment_mask != 0;
   const bool intentional_depth_only = !state.pixel_shader_resource &&
       NativeMissingPixelShaderIsIntentional(state.pixel_shader,
@@ -22470,7 +22580,8 @@ VkPipeline Gta4NativeGraphicsSystem::GetOrCreatePipeline(
   capabilities.separate_stencil_mask_ref = properties.separateStencilMaskRef;
   capabilities.fill_mode_non_solid = properties.fillModeNonSolid;
   capabilities.independent_blend = properties.independentBlend;
-  capabilities.triangle_fans = !properties.portabilitySubset || properties.triangleFans;
+  capabilities.triangle_fans = REXCVAR_GET(gta4_native_triangle_fans) &&
+                               (!properties.portabilitySubset || properties.triangleFans);
   capabilities.attachmentless_samples = properties.framebufferNoAttachmentsSampleCounts;
   capabilities.moltenvk_primitive_restart = properties.driverID == VK_DRIVER_ID_MOLTENVK;
   NativePipelineKey key;
@@ -23727,6 +23838,7 @@ bool Gta4NativeGraphicsSystem::BindCommonDrawState(
     profile::CpuCall(profile::CpuOp::kDriverDynamic, [&] { return dfn.vkCmdSetViewport(command_buffer, 0, 1, &viewport); });
   }
   const VkRect2D& scissor = dynamic_derivation.scissor;
+  rex::graphics::gta4_native::pass_stats::Draw(scissor, viewport);
   if (native_draw_state_cache_.UpdateScissor(
           {scissor.offset.x, scissor.offset.y, scissor.extent.width, scissor.extent.height})) {
     profile::CpuCall(profile::CpuOp::kDriverDynamic, [&] { return dfn.vkCmdSetScissor(command_buffer, 0, 1, &scissor); });
@@ -25540,7 +25652,7 @@ bool Gta4NativeGraphicsSystem::RecordPackedDepthAlias(
   rendering.layerCount = 1;
   rendering.colorAttachmentCount = 1;
   rendering.pColorAttachments = &attachment;
-  profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return dfn.vkCmdBeginRendering(command_buffer, &rendering); });
+  profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return (rex::graphics::gta4_native::pass_stats::Begin(&rendering, __LINE__), dfn.vkCmdBeginRendering(command_buffer, &rendering)); });
   const VkViewport viewport{0.0f, 0.0f, float(destination.width), float(destination.height), 0.0f, 1.0f};
   const VkRect2D scissor{{0, 0}, {destination.width, destination.height}};
   profile::CpuCall(profile::CpuOp::kDriverDynamic, [&] { return dfn.vkCmdSetViewport(command_buffer, 0, 1, &viewport); });
@@ -25555,7 +25667,7 @@ bool Gta4NativeGraphicsSystem::RecordPackedDepthAlias(
   profile::CpuCall(profile::CpuOp::kDriverDynamic, [&] { return dfn.vkCmdPushConstants(command_buffer, resolve_conversion_pipeline_layout_,
       VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(constants), &constants); });
   profile::CpuCall(profile::CpuOp::kDriverDraw, [&] { return dfn.vkCmdDraw(command_buffer, 3, 1, 0, 0); });
-  profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return dfn.vkCmdEndRendering(command_buffer); });
+  profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return (rex::graphics::gta4_native::pass_stats::End(__LINE__), dfn.vkCmdEndRendering(command_buffer)); });
   auto& ready = barriers[1];
   ready.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
   ready.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
@@ -25800,7 +25912,7 @@ bool Gta4NativeGraphicsSystem::RecordResolveConversion(
   rendering_info.layerCount = 1;
   rendering_info.colorAttachmentCount = hdr_mirror ? 2 : 1;
   rendering_info.pColorAttachments = color_attachments.data();
-  profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return dfn.vkCmdBeginRendering(command_buffer, &rendering_info); });
+  profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return (rex::graphics::gta4_native::pass_stats::Begin(&rendering_info, __LINE__), dfn.vkCmdBeginRendering(command_buffer, &rendering_info)); });
   VkViewport viewport{};
   viewport.width = float(mip_width);
   viewport.height = float(mip_height);
@@ -25868,7 +25980,7 @@ bool Gta4NativeGraphicsSystem::RecordResolveConversion(
   profile::CpuCall(profile::CpuOp::kDriverDynamic, [&] { return dfn.vkCmdPushConstants(command_buffer, resolve_conversion_pipeline_layout_,
                          VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(constants), &constants); });
   profile::CpuCall(profile::CpuOp::kDriverDraw, [&] { return dfn.vkCmdDraw(command_buffer, 3, 1, 0, 0); });
-  profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return dfn.vkCmdEndRendering(command_buffer); });
+  profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return (rex::graphics::gta4_native::pass_stats::End(__LINE__), dfn.vkCmdEndRendering(command_buffer)); });
 
   std::array<VkImageMemoryBarrier, 2> destination_barriers{};
   VkImageMemoryBarrier& destination_barrier = destination_barriers[0];
@@ -26325,8 +26437,8 @@ bool Gta4NativeGraphicsSystem::RecordDepthResolveConversion(
       rendering_info.layerCount = 1;
       rendering_info.pDepthAttachment = &depth_attachment;
       rendering_info.pStencilAttachment = &stencil_attachment;
-      profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return dfn.vkCmdBeginRendering(command_buffer, &rendering_info); });
-      profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return dfn.vkCmdEndRendering(command_buffer); });
+      profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return (rex::graphics::gta4_native::pass_stats::Begin(&rendering_info, __LINE__), dfn.vkCmdBeginRendering(command_buffer, &rendering_info)); });
+      profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return (rex::graphics::gta4_native::pass_stats::End(__LINE__), dfn.vkCmdEndRendering(command_buffer)); });
 
       std::array<VkImageMemoryBarrier, 2> read_barriers{};
       for (VkImageMemoryBarrier& barrier : read_barriers) {
@@ -26475,7 +26587,7 @@ bool Gta4NativeGraphicsSystem::RecordDepthResolveConversion(
   rendering_info.renderArea.extent = {mip_width, mip_height};
   rendering_info.layerCount = 1;
   rendering_info.pDepthAttachment = &depth_attachment;
-  profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return dfn.vkCmdBeginRendering(command_buffer, &rendering_info); });
+  profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return (rex::graphics::gta4_native::pass_stats::Begin(&rendering_info, __LINE__), dfn.vkCmdBeginRendering(command_buffer, &rendering_info)); });
   VkViewport viewport{};
   viewport.width = float(mip_width);
   viewport.height = float(mip_height);
@@ -26503,7 +26615,7 @@ bool Gta4NativeGraphicsSystem::RecordDepthResolveConversion(
   profile::CpuCall(profile::CpuOp::kDriverDynamic, [&] { return dfn.vkCmdPushConstants(command_buffer, resolve_conversion_pipeline_layout_,
                          VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(constants), &constants); });
   profile::CpuCall(profile::CpuOp::kDriverDraw, [&] { return dfn.vkCmdDraw(command_buffer, 3, 1, 0, 0); });
-  profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return dfn.vkCmdEndRendering(command_buffer); });
+  profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return (rex::graphics::gta4_native::pass_stats::End(__LINE__), dfn.vkCmdEndRendering(command_buffer)); });
 
   VkImageMemoryBarrier destination_barrier{};
   destination_barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -26719,7 +26831,7 @@ bool Gta4NativeGraphicsSystem::RecordSurfaceMaterialization(
   rendering_info.layerCount = 1;
   rendering_info.colorAttachmentCount = 1;
   rendering_info.pColorAttachments = &attachment;
-  profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return dfn.vkCmdBeginRendering(command_buffer, &rendering_info); });
+  profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return (rex::graphics::gta4_native::pass_stats::Begin(&rendering_info, __LINE__), dfn.vkCmdBeginRendering(command_buffer, &rendering_info)); });
   VkViewport viewport{};
   viewport.width = float(destination.width);
   viewport.height = float(destination.height);
@@ -26761,7 +26873,7 @@ bool Gta4NativeGraphicsSystem::RecordSurfaceMaterialization(
   profile::CpuCall(profile::CpuOp::kDriverDynamic, [&] { return dfn.vkCmdPushConstants(command_buffer, resolve_conversion_pipeline_layout_,
                          VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(constants), &constants); });
   profile::CpuCall(profile::CpuOp::kDriverDraw, [&] { return dfn.vkCmdDraw(command_buffer, 3, 1, 0, 0); });
-  profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return dfn.vkCmdEndRendering(command_buffer); });
+  profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return (rex::graphics::gta4_native::pass_stats::End(__LINE__), dfn.vkCmdEndRendering(command_buffer)); });
 
   source->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
   destination.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
@@ -27060,7 +27172,7 @@ bool Gta4NativeGraphicsSystem::RecordDepthSurfaceHandoff(VkCommandBuffer command
     rendering_info.layerCount = 1;
     rendering_info.pDepthAttachment = &depth_attachment;
     rendering_info.pStencilAttachment = &stencil_attachment;
-    profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return dfn.vkCmdBeginRendering(command_buffer, &rendering_info); });
+    profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return (rex::graphics::gta4_native::pass_stats::Begin(&rendering_info, __LINE__), dfn.vkCmdBeginRendering(command_buffer, &rendering_info)); });
     VkViewport viewport{};
     viewport.width = float(destination->width);
     viewport.height = float(destination->height);
@@ -27081,7 +27193,7 @@ bool Gta4NativeGraphicsSystem::RecordDepthSurfaceHandoff(VkCommandBuffer command
                               VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(float24), &float24); });
     }
     profile::CpuCall(profile::CpuOp::kDriverDraw, [&] { return dfn.vkCmdDraw(command_buffer, 3, 1, 0, 0); });
-    profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return dfn.vkCmdEndRendering(command_buffer); });
+    profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return (rex::graphics::gta4_native::pass_stats::End(__LINE__), dfn.vkCmdEndRendering(command_buffer)); });
 
     ClaimSurfaceContent(*destination, handoff.destination, true, submitted_frame,
                         native_command.render_phase,
@@ -27260,8 +27372,8 @@ bool Gta4NativeGraphicsSystem::RecordDepthSurfaceHandoff(VkCommandBuffer command
     stencil_rendering.renderArea.extent = {destination->width, destination->height};
     stencil_rendering.layerCount = 1;
     stencil_rendering.pStencilAttachment = &stencil_initialization;
-    profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return dfn.vkCmdBeginRendering(command_buffer, &stencil_rendering); });
-    profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return dfn.vkCmdEndRendering(command_buffer); });
+    profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return (rex::graphics::gta4_native::pass_stats::Begin(&stencil_rendering, __LINE__), dfn.vkCmdBeginRendering(command_buffer, &stencil_rendering)); });
+    profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return (rex::graphics::gta4_native::pass_stats::End(__LINE__), dfn.vkCmdEndRendering(command_buffer)); });
 
     VkImageMemoryBarrier stencil_to_resolve{};
     stencil_to_resolve.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -27662,7 +27774,7 @@ bool Gta4NativeGraphicsSystem::RecordResolveClears(VkCommandBuffer command_buffe
     stencil_attachment.loadOp = stencil_plan.load;
     SetNativeRenderingAttachmentBindings(rendering_info, surface->aspect, attachment,
                                          stencil_attachment);
-    profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return dfn.vkCmdBeginRendering(command_buffer, &rendering_info); });
+    profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return (rex::graphics::gta4_native::pass_stats::Begin(&rendering_info, __LINE__), dfn.vkCmdBeginRendering(command_buffer, &rendering_info)); });
 
     if (primary_plan.explicit_clear) {
       VkClearRect clear_rectangle{};
@@ -27672,7 +27784,7 @@ bool Gta4NativeGraphicsSystem::RecordResolveClears(VkCommandBuffer command_buffe
       clear_rectangle.layerCount = 1;
       profile::CpuCall(profile::CpuOp::kDriverCopy, [&] { return dfn.vkCmdClearAttachments(command_buffer, 1, &clear_attachment, 1, &clear_rectangle); });
     }
-    profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return dfn.vkCmdEndRendering(command_buffer); });
+    profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return (rex::graphics::gta4_native::pass_stats::End(__LINE__), dfn.vkCmdEndRendering(command_buffer)); });
     ClaimSurfaceContent(*surface, descriptor, depth, submitted_frame, command.render_phase,
                         NativePlacementOwner::WriteKind::kResolveClear, clear_attachment.aspectMask);
     if (depth) {
@@ -28797,7 +28909,7 @@ bool Gta4NativeGraphicsSystem::RecordPresent(
       rendering_info.layerCount = 1;
       rendering_info.colorAttachmentCount = 1;
       rendering_info.pColorAttachments = &color_attachment;
-      profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return dfn.vkCmdBeginRendering(command_buffer, &rendering_info); });
+      profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return (rex::graphics::gta4_native::pass_stats::Begin(&rendering_info, __LINE__), dfn.vkCmdBeginRendering(command_buffer, &rendering_info)); });
       VkViewport viewport{};
       viewport.width = float(presenter_width);
       viewport.height = float(presenter_height);
@@ -28854,7 +28966,7 @@ bool Gta4NativeGraphicsSystem::RecordPresent(
       profile::CpuCall(profile::CpuOp::kDriverDynamic, [&] { return dfn.vkCmdPushConstants(command_buffer, resolve_conversion_pipeline_layout_,
                              VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(constants), &constants); });
       profile::CpuCall(profile::CpuOp::kDriverDraw, [&] { return dfn.vkCmdDraw(command_buffer, 3, 1, 0, 0); });
-      profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return dfn.vkCmdEndRendering(command_buffer); });
+      profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return (rex::graphics::gta4_native::pass_stats::End(__LINE__), dfn.vkCmdEndRendering(command_buffer)); });
       FireImage(command_buffer, "present-output", nullptr, nullptr, nullptr,
           presenter_image, ui::vulkan::VulkanPresenter::kGuestOutputFormat,
           VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, presenter_width, presenter_height);
@@ -29483,6 +29595,7 @@ bool Gta4NativeGraphicsSystem::RecordNativeFrame(
     const std::shared_ptr<const EnvironmentalDataV1>& environmental_data, bool hdr_output,
     float hdr_headroom, bool& presenter_transfer_written, bool& presenter_written,
     bool trace_stages, uint32_t trace_sequence, bool force_content_probe) {
+  rex::graphics::gta4_native::pass_stats::Frame();
   SetNativeWorkerDiagnosticPhase(NativeWorkerDiagnosticPhase::kFramePlanning);
   SetNativeWorkerDiagnosticFrameProgress(0, uint32_t(current_frame_.size()),
                                          CommandType(UINT32_MAX));
@@ -29572,6 +29685,9 @@ bool Gta4NativeGraphicsSystem::RecordNativeFrame(
   bool rendering = false;
   NativeRenderingTarget active_target;
   const NativeCommand* active_scope_command = nullptr;
+  // Command whose guest descriptors the active scope's attachments were bound
+  // from (superset scope reuse keeps those attachments for later draws).
+  const NativeCommand* active_scope_begin_command = nullptr;
   uint64_t active_scope_virtual_revision = 0;
   if (!recording_resources_.Reset()) return false;
   NativeFrameResources& resources = recording_resources_;
@@ -29617,7 +29733,8 @@ bool Gta4NativeGraphicsSystem::RecordNativeFrame(
   const auto& dfn = vulkan_provider->vulkan_device()->functions();
   NativeProducerDepthResolve producer_depth_resolve{};
   NativeProducerDepthResolveScan producer_depth_resolve_scan{};
-  const auto end_rendering = [&] {
+  const auto end_rendering = [&](int site = __builtin_LINE()) {
+    rex::graphics::gta4_native::pass_stats::End(site);
     profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return dfn.vkCmdEndRendering(command_buffer); });
     CompleteProducerDepthResolve(command_buffer, producer_depth_resolve);
   };
@@ -34259,7 +34376,145 @@ bool Gta4NativeGraphicsSystem::RecordNativeFrame(
           if(development_diagnostics_)++native_cross_phase_scope_reuses_;
       }
     }
-    if (!rendering || (!targets_equal(active_target, target) && !reuse_component_scope)) {
+    // Attachment-subset scope reuse. A draw binds only the attachments it can
+    // access, so GTA IV's deferred lights, which alternate stencil-only setup
+    // draws (no color writes, hence no color attachment) with color draws on
+    // the same guest targets, end the rendering scope at every switch, and a
+    // tile-based GPU reloads and stores every attachment per scope. When this
+    // draw's attachments are a strict subset of the active scope's, bound from
+    // the same guest surfaces, keep the scope and record the draw against the
+    // active attachments with its own write mask. The extra attachments get a
+    // zero mask, so they are never claimed, cleared or transitioned. GTA IV
+    // unbinds its color target for the stencil setup, so they are validated
+    // against the descriptors the scope was opened with, not this command's.
+    bool reuse_superset_scope = false;
+    if (rendering && active_scope_command && active_scope_begin_command &&
+        active_scope_begin_command->pipeline_state && draw_command && !reuse_component_scope &&
+        REXCVAR_GET(gta4_native_superset_scope_reuse) && !targets_equal(active_target, target)) {
+      const auto& scope_state = *active_scope_begin_command->pipeline_state;
+      const auto& previous = *active_scope_command;
+      const bool previous_draw = previous.type == CommandType::kDrawPrimitive ||
+                                 previous.type == CommandType::kDrawPrimitiveUp ||
+                                 previous.type == CommandType::kDrawIndexedPrimitive;
+      bool subset =
+          (target.color_attachment_mask & ~active_target.color_attachment_mask) == 0 &&
+          (!target.depth_stencil_attachment_active ||
+           active_target.depth_stencil_attachment_active) &&
+          (target.color_attachment_mask != active_target.color_attachment_mask ||
+           target.depth_stencil_attachment_active !=
+               active_target.depth_stencil_attachment_active);
+      for (uint32_t index = 0; subset && index < kRenderTargetCount; ++index) {
+        if ((target.color_attachment_mask & (1u << index)) != 0) {
+          subset = target.color_surfaces[index] == active_target.color_surfaces[index] &&
+                   target.color_views[index] == active_target.color_views[index] &&
+                   target.color_formats[index] == active_target.color_formats[index] &&
+                   NativeSurfaceStateEqual(scope_state.render_targets[index],
+                                           command.pipeline_state->render_targets[index]);
+        }
+      }
+      if (subset && target.depth_stencil_attachment_active) {
+        subset = target.depth_surface == active_target.depth_surface &&
+                 target.depth_view == active_target.depth_view &&
+                 target.depth_format == active_target.depth_format &&
+                 NativeSurfaceStateEqual(scope_state.depth_stencil,
+                                         command.pipeline_state->depth_stencil);
+      }
+      // Same safety conditions as component scope reuse above.
+      reuse_superset_scope =
+          subset && previous_draw && !target.uses_presenter && !active_target.uses_presenter &&
+          !target.is_reflection && !active_target.is_reflection &&
+          target.samples == VK_SAMPLE_COUNT_1_BIT && active_target.samples == target.samples &&
+          target.guest_samples == active_target.guest_samples &&
+          target.width == active_target.width && target.height == active_target.height &&
+          target.logical_width == active_target.logical_width &&
+          target.logical_height == active_target.logical_height &&
+          (!NativeGraphicsPreparationEnabled() || !producer_depth_resolve.attached) &&
+          (NativeGraphicsPreparationEnabled() ||
+           (previous.render_phase == command.render_phase &&
+            previous.render_phase_object == command.render_phase_object)) &&
+          !diagnostic_frame && !collect_frame_diagnostics && !force_content_probe &&
+          !diagnostic_variants_enabled && !fire_images_ && !bulb_trace_frame_ &&
+          !PhoneTraceConfig().readbacks && !NativeRendererEventTraceEnabled() &&
+          !ShouldCaptureArtificialLightFrame(submitted_frame) &&
+          !rex::diagnostics::IsEnabled(rex::diagnostics::Category::kNativeProbes) &&
+          active_scope_virtual_revision ==
+              virtual_surface_registry_revision_.load(std::memory_order_acquire);
+      // Every attachment that stays live must still own the guest placement it
+      // was bound from.
+      for (uint32_t index = 0; reuse_superset_scope && index < kRenderTargetCount; ++index) {
+        if ((active_target.color_attachment_mask & (1u << index)) != 0) {
+          reuse_superset_scope = active_target.color_surfaces[index] &&
+              active_target.color_surfaces[index]->layout ==
+                  VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL &&
+              HasCurrentPlacementContent(*active_target.color_surfaces[index],
+                  scope_state.render_targets[index], false, submitted_frame);
+        }
+      }
+      if (reuse_superset_scope && active_target.depth_stencil_attachment_active) {
+        reuse_superset_scope = active_target.depth_surface &&
+            active_target.depth_surface->layout ==
+                VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL &&
+            HasCurrentPlacementContent(*active_target.depth_surface,
+                scope_state.depth_stencil, true, submitted_frame);
+      }
+      if (reuse_superset_scope) {
+        const uint32_t write_mask = target.color_write_mask;
+        target = active_target;
+        target.color_write_mask = write_mask;
+      }
+    }
+    if (rex::graphics::gta4_native::pass_stats::Enabled() && rendering &&
+        !targets_equal(active_target, target) && !reuse_component_scope && !reuse_superset_scope) {
+      const auto type_name = [](const NativeCommand* c) -> const char* {
+        if (!c) return "none";
+        switch (c->type) {
+          case CommandType::kDrawPrimitive: case CommandType::kDrawPrimitiveUp:
+          case CommandType::kDrawIndexedPrimitive: return "draw";
+          case CommandType::kClear: return "clear";
+          default: return "other";
+        }
+      };
+      bool same_surfaces = true;
+      for (uint32_t index = 0; index < kRenderTargetCount; ++index) {
+        if ((target.color_attachment_mask & (1u << index)) != 0) {
+          same_surfaces &= target.color_views[index] == active_target.color_views[index];
+        }
+      }
+      if (target.depth_stencil_attachment_active) {
+        same_surfaces &= target.depth_view == active_target.depth_view;
+      }
+      const bool desc_equal = active_scope_command && active_scope_command->pipeline_state &&
+          command.pipeline_state &&
+          NativeSurfaceStateEqual(active_scope_command->pipeline_state->depth_stencil,
+                                  command.pipeline_state->depth_stencil) &&
+          std::equal(active_scope_command->pipeline_state->render_targets.begin(),
+                     active_scope_command->pipeline_state->render_targets.end(),
+                     command.pipeline_state->render_targets.begin(),
+                     [](const auto& a, const auto& b) { return NativeSurfaceStateEqual(a, b); });
+      const bool diag = diagnostic_frame || collect_frame_diagnostics || force_content_probe ||
+          diagnostic_variants_enabled || fire_images_ || bulb_trace_frame_ ||
+          PhoneTraceConfig().readbacks || NativeRendererEventTraceEnabled() ||
+          ShouldCaptureArtificialLightFrame(submitted_frame) ||
+          rex::diagnostics::IsEnabled(rex::diagnostics::Category::kNativeProbes);
+      rex::graphics::gta4_native::pass_stats::Reason(fmt::format(
+          "prev={} cur={} A=c{:x}/w{:x}/d{:d} T=c{:x}/w{:x}/d{:d} views={:d} desc={:d} rev={:d} "
+          "dims={:d} ms={:d} pres/refl={:d}{:d} diag={:d} dres={:d}",
+          type_name(active_scope_command), type_name(&command), active_target.color_attachment_mask,
+          active_target.color_write_mask, active_target.depth_stencil_attachment_active,
+          target.color_attachment_mask, target.color_write_mask,
+          target.depth_stencil_attachment_active, same_surfaces, desc_equal,
+          active_scope_virtual_revision ==
+              virtual_surface_registry_revision_.load(std::memory_order_acquire),
+          target.width == active_target.width && target.height == active_target.height &&
+              target.logical_width == active_target.logical_width &&
+              target.logical_height == active_target.logical_height,
+          target.samples == VK_SAMPLE_COUNT_1_BIT && active_target.samples == target.samples,
+          target.uses_presenter || active_target.uses_presenter,
+          target.is_reflection || active_target.is_reflection, diag,
+          producer_depth_resolve.attached));
+    }
+    if (!rendering || (!targets_equal(active_target, target) && !reuse_component_scope &&
+                       !reuse_superset_scope)) {
       if (rendering) {
         end_rendering();
       }
@@ -34469,7 +34724,7 @@ bool Gta4NativeGraphicsSystem::RecordNativeFrame(
             command_buffer, command_index, target, depth_attachment, stencil_attachment,
             producer_depth_resolve_scan);
       }
-      profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return dfn.vkCmdBeginRendering(command_buffer, &rendering_info); });
+      profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return (rex::graphics::gta4_native::pass_stats::Begin(&rendering_info, __LINE__), dfn.vkCmdBeginRendering(command_buffer, &rendering_info)); });
       InsertNativeGpuPassLabel(command_buffer,command,true);
       // A load-op clear is itself a complete attachment write. Record it
       // immediately so a later scope break in the same reflection capture may
@@ -34548,7 +34803,7 @@ bool Gta4NativeGraphicsSystem::RecordNativeFrame(
         }
         depth_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
         stencil_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-        profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return dfn.vkCmdBeginRendering(command_buffer, &rendering_info); });
+        profile::CpuCall(profile::CpuOp::kDriverRendering, [&] { return (rex::graphics::gta4_native::pass_stats::Begin(&rendering_info, __LINE__), dfn.vkCmdBeginRendering(command_buffer, &rendering_info)); });
       InsertNativeGpuPassLabel(command_buffer,command,true);
       }
       rendering = true;
@@ -34556,6 +34811,7 @@ bool Gta4NativeGraphicsSystem::RecordNativeFrame(
         presenter_written = true;
       }
       active_target = target;
+      active_scope_begin_command = &command;
       active_scope_virtual_revision =
           virtual_surface_registry_revision_.load(std::memory_order_acquire);
     } else if (reuse_component_scope) {

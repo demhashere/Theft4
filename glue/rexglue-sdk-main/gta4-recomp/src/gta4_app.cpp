@@ -5,6 +5,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <mutex>
 #include <unordered_set>
 #include <vector>
@@ -171,8 +172,9 @@ REXCVAR_DEFINE_STRING(gta4_native_smaa_quality, "high", "GTA IV/Graphics/Anti-Al
                       "SMAA 1x preset: low, medium, high, or ultra")
     .allowed({"low", "medium", "high", "ultra"});
 REXCVAR_DEFINE_STRING(gta4_native_upscaler, "native", "GTA IV/Graphics/Upscaling",
-                      "Output upscaler: native or fsr1")
-    .allowed({"native", "fsr1"})
+                      "Output upscaler: native, fsr1, or bilinear (renders at the "
+                      "gta4_fsr1_quality scale and scales up without FSR reconstruction)")
+    .allowed({"native", "fsr1", "bilinear"})
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_STRING(gta4_fsr1_quality, "quality", "GTA IV/Graphics/Upscaling",
                       "FSR 1 preset: ultra_quality, quality, balanced, or performance")
@@ -616,6 +618,14 @@ std::optional<rex::PathConfig> GTA4App::OnFinalizePaths(
 }
 
 void GTA4App::OnPreSetup(rex::RuntimeConfig& config) {
+#if REX_PLATFORM_GNU_LINUX
+  // Renderer and audio policies the iOS build ships enabled. They are read on
+  // first use, after this point; an explicit environment value still wins.
+  for (const char* name : {"THEFT4_GRAPHICS_PREPARATION", "THEFT4_CONSTANT_REUSE",
+                           "THEFT4_XMA_INLINE", "THEFT4_HARDWARE_SMAA", "THEFT4_FUSED_SMAA"}) {
+    setenv(name, "1", 0);
+  }
+#endif
   rex::input::mnk::SetNativeControllerCompatibilityBindings(
       gta4::input::KeyboardControllerBindings());
   if (!config.graphics && config.gpu_plugin.empty()) {

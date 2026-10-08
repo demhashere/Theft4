@@ -475,6 +475,16 @@ std::unique_ptr<Surface> WindowSDL::CreateSurfaceImpl(Surface::TypeFlags allowed
     }
   }
 #else
+  if (allowed_types & Surface::kTypeFlag_WaylandWindow) {
+    SDL_PropertiesID props = SDL_GetWindowProperties(sdl_window_);
+    auto* display = static_cast<wl_display*>(
+        SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WAYLAND_DISPLAY_POINTER, nullptr));
+    auto* surface = static_cast<wl_surface*>(
+        SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WAYLAND_SURFACE_POINTER, nullptr));
+    if (display && surface) {
+      return std::make_unique<WaylandWindowSurface>(sdl_window_, display, surface);
+    }
+  }
   if (allowed_types & Surface::kTypeFlag_XcbWindow) {
     SDL_PropertiesID props = SDL_GetWindowProperties(sdl_window_);
     auto* display = static_cast<Display*>(

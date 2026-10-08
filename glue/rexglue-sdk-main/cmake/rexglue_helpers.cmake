@@ -6,6 +6,8 @@
 #   rexglue_configure_target(<target>)             - host application
 #   rexglue_configure_module_target(<target> ...)  - guest DLL module
 #==========================================================
+set(REXGLUE_AARCH64_CPU "" CACHE STRING
+    "aarch64 -mcpu for recompiled code (e.g. apple-m1); empty uses generic -march=armv8-a")
 macro(_rexglue_normalize_macos_vulkan_root candidate out_var)
     set(${out_var} "")
     if(NOT "${candidate}" STREQUAL "")
@@ -155,7 +157,13 @@ function(rexglue_apply_target_settings target_name)
             target_link_options(${target_name} PRIVATE -Wl,--no-relax)
             target_compile_options(${target_name} PRIVATE -mcmodel=large)
         elseif(_rexglue_target_processor MATCHES "aarch64|ARM64|arm64")
-            target_compile_options(${target_name} PRIVATE -march=armv8-a)
+            # REXGLUE_AARCH64_CPU tunes recompiled code for a specific core
+            # (e.g. apple-m1: inline LSE atomics, Apple scheduling).
+            if(REXGLUE_AARCH64_CPU)
+                target_compile_options(${target_name} PRIVATE -mcpu=${REXGLUE_AARCH64_CPU})
+            else()
+                target_compile_options(${target_name} PRIVATE -march=armv8-a)
+            endif()
         endif()
     endif()
 

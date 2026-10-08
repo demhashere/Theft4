@@ -36,20 +36,39 @@ namespace {
 using namespace rex::literals;
 
 constexpr uint32_t kGta4TitleId = 0x545407F2;
-constexpr uint32_t kGta4UsaMediaId = 0x6AC07221;
-constexpr uint32_t kRequiredRegion = rex::XEX_REGION_NTSCU;
-// Derived from the pinned v8 XEXP delta descriptor's source_version_value.
-constexpr uint32_t kRequiredBaseVersion = 0x00000005;
-// Full-file XXH3-64 recorded by the official Liberty installer for the GTA IV
-// USA retail 1.00 default.xex. This complements the XEXP signature digest:
-// retaining a valid header/signature is not sufficient if the XEX body changed.
-constexpr uint64_t kRequiredBaseXexXxh3 = 2823947441600373906ULL;
-// SHA-1 of the 0x100-byte RSA signature required by the pinned v8 XEXP's
-// digest_source. Derived from the payload, not from a patched executable.
-constexpr std::array<uint8_t, 20> kRequiredRsaSignatureSha1 = {
-    0x19, 0x2B, 0x3F, 0x56, 0x7C, 0x59, 0x36, 0x0C, 0x6C, 0xE2,
-    0x11, 0x82, 0x0D, 0x77, 0x6F, 0x6B, 0x25, 0x25, 0x1A, 0x89,
+// Each supported retail release is pinned by media ID, region flags, version,
+// the SHA-1 of the RSA signature its v8 XEXP's digest_source requires (derived
+// from the payload, not from a patched executable) and the full-file XXH3-64
+// of default.xex: retaining a valid header/signature is not sufficient if the
+// XEX body changed. The Europe release patches to an image whose recompiled
+// code is identical to the USA image this build was generated from.
+struct SupportedSource {
+  const char* label;
+  uint32_t media_id;
+  uint32_t region;
+  uint32_t base_version;
+  std::array<uint8_t, 20> rsa_signature_sha1;
+  uint64_t base_xex_xxh3;
 };
+constexpr std::array<SupportedSource, 2> kSupportedSources = {{
+    {"Retail 1.00 (USA)", 0x6AC07221, rex::XEX_REGION_NTSCU, 0x00000005,
+     {0x19, 0x2B, 0x3F, 0x56, 0x7C, 0x59, 0x36, 0x0C, 0x6C, 0xE2,
+      0x11, 0x82, 0x0D, 0x77, 0x6F, 0x6B, 0x25, 0x25, 0x1A, 0x89},
+     2823947441600373906ULL},
+    {"Retail 1.00 (Europe)", 0x4A53F9F6, 0x00FFFD00, 0x00000006,
+     {0xA2, 0x4D, 0xFE, 0x5C, 0x65, 0x1F, 0xF8, 0x53, 0x83, 0x55,
+      0xCC, 0xC4, 0x7F, 0x68, 0x75, 0x33, 0xF5, 0x6E, 0xEA, 0x44},
+     16038580895545601006ULL},
+}};
+
+const SupportedSource* FindSupportedSource(uint32_t media_id) {
+  for (const auto& source : kSupportedSources) {
+    if (source.media_id == media_id) {
+      return &source;
+    }
+  }
+  return nullptr;
+}
 constexpr size_t kMaximumMetadataFileSize = 64_MiB;
 constexpr size_t kMaximumTreeEntries = 500000;
 constexpr size_t kMaximumOptionalHeaders = 4096;
@@ -460,31 +479,32 @@ GameSourceInspection ClassifyGameSourceMetadata(const GameSourceMetadata& metada
     result.status = GameSourceStatus::kWrongGame;
     result.rejection_reason = fmt::format("Title ID {:08X} is not Grand Theft Auto IV ({:08X}).",
                                           metadata.title_id, kGta4TitleId);
-  } else if (metadata.media_id != kGta4UsaMediaId) {
+  } else if (!FindSupportedSource(metadata.media_id)) {
     result.status = GameSourceStatus::kWrongMediaId;
-    result.rejection_reason =
-        fmt::format("Media ID {:08X} is not the supported USA retail media ({:08X}).",
-                    metadata.media_id, kGta4UsaMediaId);
-  } else if (metadata.region != kRequiredRegion) {
+    result.rejection_reason = fmt::format(
+        "Media ID {:08X} is not a supported retail media (USA 6AC07221 or Europe 4A53F9F6).",
+        metadata.media_id);
+  } else if (const SupportedSource& source = *FindSupportedSource(metadata.media_id);
+             metadata.region != source.region) {
     result.status = GameSourceStatus::kWrongRegion;
     result.rejection_reason = fmt::format(
-        "The source is {}; exact USA region flags ({:08X}) are required. Region-free and "
-        "multi-region images are unsupported.",
-        FormatXexRegion(metadata.region), kRequiredRegion);
-  } else if (metadata.xex_version != kRequiredBaseVersion ||
-             metadata.base_version != kRequiredBaseVersion) {
+        "The source is {}; exact region flags ({:08X}) are required for this media. Region-free "
+        "and modified images are unsupported.",
+        FormatXexRegion(metadata.region), source.region);
+  } else if (metadata.xex_version != source.base_version ||
+             metadata.base_version != source.base_version) {
     result.status = GameSourceStatus::kWrongRevision;
     result.rejection_reason =
         fmt::format("XEX/base versions {}/{} do not match retail 1.00 ({}/{}).",
                     FormatXexVersion(metadata.xex_version), FormatXexVersion(metadata.base_version),
-                    FormatXexVersion(kRequiredBaseVersion), FormatXexVersion(kRequiredBaseVersion));
-  } else if (metadata.rsa_signature_sha1 != kRequiredRsaSignatureSha1) {
+                    FormatXexVersion(source.base_version), FormatXexVersion(source.base_version));
+  } else if (metadata.rsa_signature_sha1 != source.rsa_signature_sha1) {
     result.status = GameSourceStatus::kWrongSignature;
     result.rejection_reason =
         "The XEX RSA signature does not match the retail 1.00 source required by the v8 patch.";
   } else {
     result.status = GameSourceStatus::kSupported;
-    result.release_label = "Retail 1.00";
+    result.release_label = source.label;
   }
   return result;
 }
@@ -496,11 +516,13 @@ GameSourceInspection InspectGameXex(std::span<const uint8_t> bytes) {
     return Rejected(GameSourceStatus::kCorruptImage, GameSourceKind::kUnknown, std::move(error));
   }
   GameSourceInspection result = ClassifyGameSourceMetadata(metadata);
-  if (result.supported() && XXH3_64bits(bytes.data(), bytes.size()) != kRequiredBaseXexXxh3) {
+  if (result.supported() &&
+      XXH3_64bits(bytes.data(), bytes.size()) !=
+          FindSupportedSource(metadata.media_id)->base_xex_xxh3) {
     result.status = GameSourceStatus::kWrongExecutable;
     result.release_label.clear();
     result.rejection_reason =
-        "The complete default.xex does not match GTA IV USA retail 1.00.";
+        "The complete default.xex does not match the supported GTA IV retail 1.00 release.";
   }
   return result;
 }

@@ -1,0 +1,18 @@
+diff --git a/src/events/SDL_events.c b/src/events/SDL_events.c
+index f682775..2b1d58f 100644
+--- a/src/events/SDL_events.c
++++ b/src/events/SDL_events.c
+@@ -1661,6 +1661,13 @@ static int SDL_WaitEventTimeout_Device(SDL_VideoDevice *_this, SDL_Window *wakeu
+             }
+         }
+         SDL_SetAtomicPointer(&_this->wakeup_window, wakeup_window);
++        /* An event pushed from another thread after the peek above but before
++           wakeup_window was published sent no wakeup, and the wait would sleep
++           until the next poll interval (3 s for joystick/DBus polling). */
++        if (SDL_HasEvents(SDL_EVENT_FIRST, SDL_EVENT_LAST)) {
++            SDL_SetAtomicPointer(&_this->wakeup_window, NULL);
++            continue;
++        }
+         status = _this->WaitEventTimeout(_this, loop_timeoutNS);
+         SDL_SetAtomicPointer(&_this->wakeup_window, NULL);
+         if (status == 0 && poll_intervalNS != SDL_MAX_SINT64 && loop_timeoutNS == poll_intervalNS) {

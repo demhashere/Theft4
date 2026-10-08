@@ -16,9 +16,15 @@
 
 #include <SDL3/SDL.h>
 
+#include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
 #include <rex/ui/window_sdl.h>
+
+REXCVAR_DEFINE_INT32(ui_event_wait_timeout_ms, REX_PLATFORM_LINUX ? 4 : 0, "UI",
+                     "Maximum UI event-loop wait in milliseconds before re-polling "
+                     "(0 = wait indefinitely)")
+    .range(0, 1000);
 
 namespace rex::ui {
 
@@ -63,8 +69,9 @@ bool SDLWindowedAppContext::Initialize() {
   }
 #endif
 #if REX_PLATFORM_GNU_LINUX
-  // The Linux surface type the presenters consume is XcbWindow, so force X11
-  // and keep SDL off Wayland where no surface shim exists yet.
+  // Default to X11 (XWayland on Wayland sessions), the established path. This
+  // is a normal-priority hint, so SDL_VIDEO_DRIVER=wayland in the environment
+  // opts into a native Wayland window (WaylandWindowSurface).
   SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "x11");
 #endif
   if (!SDL_InitSubSystem(SDL_INIT_VIDEO)) {
@@ -98,7 +105,16 @@ void SDLWindowedAppContext::PlatformQuitFromUIThread() {
 int SDLWindowedAppContext::RunMainMessageLoop() {
   while (!HasQuitFromUIThread()) {
     SDL_Event event;
-    if (!SDL_WaitEvent(&event)) {
+    // Vulkan's X11 WSI shares SDL's display connection and can read SDL's
+    // wakeup ClientMessage off the socket between SDL's pending check and its
+    // poll, leaving this thread asleep until SDL's 3 s device poll. A bounded
+    // wait limits a lost wakeup to a short paint delay.
+    const int32_t max_wait_ms = REXCVAR_GET(ui_event_wait_timeout_ms);
+    if (max_wait_ms > 0) {
+      if (!SDL_WaitEventTimeout(&event, max_wait_ms)) {
+        continue;
+      }
+    } else if (!SDL_WaitEvent(&event)) {
       REXLOG_ERROR("SDL_WaitEvent failed: {}", SDL_GetError());
       return EXIT_FAILURE;
     }

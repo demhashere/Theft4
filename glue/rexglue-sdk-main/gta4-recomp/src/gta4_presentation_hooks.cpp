@@ -160,22 +160,28 @@ extern "C" void sub_822CF300(PPCContext& ctx, uint8_t* base) {
   const uint32_t requested = ctx.r6.u32;
   const uint32_t caller = ctx.lr;
   const bool disable = gta4::presentation::DisableTladFilmGrain();
+  const bool no_motion_blur = !gta4::presentation::MotionBlurEnabled();
   const bool trace = Diagnostics();
-  if (caller != policy::kCompositeCaller || (!disable && !trace) ||
+  if (caller != policy::kCompositeCaller || (!disable && !no_motion_blur && !trace) ||
       !GuestSpan(base, kEpisode, sizeof(uint32_t))) {
     __imp__sub_822CF300(ctx, base);
     return;
   }
   const uint32_t episode = REX_LOAD_U32(kEpisode);
   const uint32_t postfx = ctx.r3.u32;
-  bool valid = false;
-  if (episode == 1 && policy::IsNoisePass(requested) && ctx.r4.u32 == 0 &&
-      GuestSpan(base, postfx, kCompositeTechniqueOffset + sizeof(uint32_t))) {
+  // Pass remaps apply only to the stock composite technique on the main target.
+  bool composite = false;
+  if (ctx.r4.u32 == 0 && GuestSpan(base, postfx, kCompositeTechniqueOffset + sizeof(uint32_t))) {
     const uint32_t effect = REX_LOAD_U32(postfx + kEffectLinkOffset);
-    valid = ctx.r5.u32 != 0 && ctx.r5.u32 == REX_LOAD_U32(postfx + kCompositeTechniqueOffset) &&
-            GuestSpan(base, effect, 28);
+    composite = ctx.r5.u32 != 0 &&
+                ctx.r5.u32 == REX_LOAD_U32(postfx + kCompositeTechniqueOffset) &&
+                GuestSpan(base, effect, 28);
   }
-  const uint32_t selected = policy::SelectCompositePass(requested, disable, episode, caller, valid);
+  const bool valid = composite && episode == 1 && policy::IsNoisePass(requested);
+  uint32_t selected = policy::SelectCompositePass(requested, disable, episode, caller, valid);
+  if (no_motion_blur && composite) {
+    selected = policy::WithoutMotionBlur(selected);
+  }
   const CompositeTraceKey key{episode, requested, selected, disable, valid};
   const bool changed = trace && (!last_composite || *last_composite != key);
   const bool record_change =

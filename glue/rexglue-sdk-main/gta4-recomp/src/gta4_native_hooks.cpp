@@ -2913,8 +2913,12 @@ NativeResolutionOverride GetNativeResolutionOverride(uint32_t requested_width,
 
   const bool ssaa_active = requested_ssaa_factor > 1u;
   const bool fsr1_requested = REXCVAR_GET(gta4_native_upscaler) == "fsr1" && !ssaa_active;
+  // Plain scaling uses the same render-scale presets; the presenter's bilinear
+  // effect then scales to the display without edge reconstruction.
+  const bool bilinear_requested =
+      REXCVAR_GET(gta4_native_upscaler) == "bilinear" && !ssaa_active;
   const bool hdr_requested = rex::cvar::Query<bool>("vulkan_hdr");
-  if (fsr1_requested && !hdr_requested) {
+  if ((fsr1_requested && !hdr_requested) || bilinear_requested) {
     const std::string& quality = REXCVAR_GET(gta4_fsr1_quality);
     const double scale = quality == "ultra_quality" ? 1.3
                          : quality == "balanced"    ? 1.7
@@ -2927,8 +2931,8 @@ NativeResolutionOverride GetNativeResolutionOverride(uint32_t requested_width,
     if (candidate_width >= 640 && candidate_height >= 360) {
       result.width = candidate_width;
       result.height = candidate_height;
-      result.fsr1_active =
-          result.width < result.display_width || result.height < result.display_height;
+      result.fsr1_active = fsr1_requested && (result.width < result.display_width ||
+                                              result.height < result.display_height);
     } else {
       static std::atomic<bool> logged_small_fsr_input{false};
       if (!logged_small_fsr_input.exchange(true)) {

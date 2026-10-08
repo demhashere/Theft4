@@ -216,10 +216,14 @@ if(REXGLUE_USE_VULKAN)
                     "${GTA4_NATIVE_DXC_ROOT}/lib/${GTA4_NATIVE_DXC_ARCH}")
             endif()
         endif()
-    elseif(CMAKE_HOST_UNIX AND GTA4_NATIVE_DXC_ARCH STREQUAL "x64")
-        set(GTA4_NATIVE_DXC "${GTA4_NATIVE_DXC_ROOT}/bin/x64/dxc-linux")
+    elseif(CMAKE_HOST_UNIX)
+        # The x64 compiler is bundled; an arm64 Linux host needs a locally
+        # built dxc-linux and libdxcompiler.so in the matching arm64 folders.
+        set(GTA4_NATIVE_DXC
+            "${GTA4_NATIVE_DXC_ROOT}/bin/${GTA4_NATIVE_DXC_ARCH}/dxc-linux")
         if(NOT GTA4_NATIVE_DXC_LIBRARY_PATH)
-            set(GTA4_NATIVE_DXC_LIBRARY_PATH "${GTA4_NATIVE_DXC_ROOT}/lib/x64")
+            set(GTA4_NATIVE_DXC_LIBRARY_PATH
+                "${GTA4_NATIVE_DXC_ROOT}/lib/${GTA4_NATIVE_DXC_ARCH}")
         endif()
     endif()
 

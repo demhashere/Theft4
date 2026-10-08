@@ -357,14 +357,25 @@ int Memory::MapViewsMac() {
 
 int Memory::MapViews(uint8_t* mapping_base) {
   assert_true(rex::countof(map_info) == rex::countof(views_.all_views));
-  // 0xE0000000 4 KB offset is emulated via host_address_offset and on the CPU
-  // side if system allocation granularity is bigger than 4 KB.
-  uint64_t granularity_mask = ~uint64_t(system_allocation_granularity_ - 1);
+  // With REX_EMULATED_PHYS_HOST_OFFSET the 0xE0000000 4 KB offset is added by
+  // host_address_offset and on the CPU side instead of by the view itself.
   for (size_t n = 0; n < rex::countof(map_info); n++) {
+    uint64_t file_offset = map_info[n].target_address;
+    if (map_info[n].virtual_address_start == 0xE0000000) {
+      file_offset -= detail::PhysicalHostOffset(0xE0000000);
+    }
+    if (file_offset & (system_allocation_granularity_ - 1)) {
+      REXSYS_ERROR(
+          "MapViews: view {:08X} file offset {:X} is not aligned to the host allocation "
+          "granularity {:X}; REX_EMULATED_PHYS_HOST_OFFSET must be enabled for this host",
+          map_info[n].virtual_address_start, file_offset, system_allocation_granularity_);
+      UnmapViews();
+      return 1;
+    }
     views_.all_views[n] = reinterpret_cast<uint8_t*>(rex::memory::MapFileView(
         mapping_, mapping_base + map_info[n].virtual_address_start,
         map_info[n].virtual_address_end - map_info[n].virtual_address_start + 1,
-        rex::memory::PageAccess::kReadWrite, map_info[n].target_address & granularity_mask));
+        rex::memory::PageAccess::kReadWrite, file_offset));
     if (!views_.all_views[n]) {
       // Failed, so bail and try again.
       UnmapViews();
@@ -1681,12 +1692,9 @@ PhysicalHeap::~PhysicalHeap() = default;
 void PhysicalHeap::Initialize(memory::Memory* memory, uint8_t* membase, HeapType heap_type,
                               uint32_t heap_base, uint32_t heap_size, uint32_t page_size,
                               VirtualHeap* parent_heap) {
-  uint32_t host_address_offset;
-  if (heap_base >= 0xE0000000 && rex::memory::allocation_granularity() > 0x1000) {
-    host_address_offset = 0x1000;
-  } else {
-    host_address_offset = 0;
-  }
+  // Must match the offset generated code adds (REX_EMULATED_PHYS_HOST_OFFSET);
+  // MapViews maps the 0xE0000000 view accordingly.
+  const uint32_t host_address_offset = detail::PhysicalHostOffset(heap_base);
 
   BaseHeap::Initialize(memory, membase, heap_type, heap_base, heap_size, page_size,
                        host_address_offset);

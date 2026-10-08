@@ -224,6 +224,21 @@ if(LIBERTY_RECOMP_GRAINE_MAC)
     return()
 endif()
 
+# Linux desktop builds the same maintained Graine consumer as macOS; the legacy
+# LibertyRecomp/ application below no longer matches the RexGlue runtime API.
+option(LIBERTY_RECOMP_GRAINE_LINUX "Build the Graine RexGlue consumer on Linux desktop" ON)
+if(LIBERTY_RECOMP_GRAINE_LINUX AND CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+   (NOT DEFINED LIBERTY_RECOMP_TARGET_PLATFORM OR
+    LIBERTY_RECOMP_TARGET_PLATFORM STREQUAL "desktop"))
+    if(NOT USE_REXGLUE_RUNTIME)
+        message(FATAL_ERROR "The Linux Graine build requires the Graine RexGlue runtime")
+    endif()
+
+    message(STATUS "Linux: building the pure Graine RexGlue consumer")
+    add_subdirectory("glue")
+    return()
+endif()
+
 add_subdirectory(${LIBERTY_RECOMP_THIRDPARTY_ROOT})
 # xbox_support: XEX/XDBF/big-endian helpers used by both desktop and console
 # builds (previously sourced from the now-removed XenonRecomp tool).

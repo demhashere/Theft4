@@ -124,7 +124,10 @@ extern PPCFuncMapping PPCFuncMappings[];
 // Memory Access
 //=============================================================================
 
-#if REX_PLATFORM_WIN32 || REX_PLATFORM_DARWIN
+#ifndef REX_EMULATED_PHYS_HOST_OFFSET
+#error "rex/platform.h must define REX_EMULATED_PHYS_HOST_OFFSET"
+#endif
+#if REX_EMULATED_PHYS_HOST_OFFSET
 #define REX_PHYS_HOST_OFFSET(addr) (((u32)(addr) >= 0xE0000000u) ? 0x1000u : 0u)
 #else
 #define REX_PHYS_HOST_OFFSET(addr) 0u

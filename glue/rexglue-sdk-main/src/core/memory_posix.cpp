@@ -88,6 +88,38 @@ size_t allocation_granularity() {
   return page_size();
 }
 
+namespace {
+
+struct HostPageRange {
+  void* base = nullptr;
+  size_t length = 0;
+};
+
+// The guest works in 4 KiB pages, but mprotect needs a host-page-aligned base
+// and AArch64 kernels may use 16 KiB (Asahi) or 64 KiB pages. Protection
+// changes cover the enclosing host pages, as on the iOS and macOS backends.
+HostPageRange AlignOutToHostPages(void* base_address, size_t length) {
+  const uintptr_t mask = uintptr_t(page_size()) - 1;
+  const uintptr_t base = reinterpret_cast<uintptr_t>(base_address);
+  const uintptr_t start = base & ~mask;
+  const uintptr_t end = (base + length + mask) & ~mask;
+  return {reinterpret_cast<void*>(start), end - start};
+}
+
+// Host pages lying wholly inside the range; empty when there are none.
+HostPageRange AlignInToHostPages(void* base_address, size_t length) {
+  const uintptr_t mask = uintptr_t(page_size()) - 1;
+  const uintptr_t base = reinterpret_cast<uintptr_t>(base_address);
+  const uintptr_t start = (base + mask) & ~mask;
+  const uintptr_t end = (base + length) & ~mask;
+  if (end <= start) {
+    return {};
+  }
+  return {reinterpret_cast<void*>(start), end - start};
+}
+
+}  // namespace
+
 uint32_t ToPosixProtectFlags(PageAccess access) {
   switch (access) {
     case PageAccess::kNoAccess:
@@ -234,19 +266,28 @@ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_ty
   }
 #endif
 
-  void* result = mmap(base_address, length, prot_initial, flags, -1, 0);
+  // A guest range that is not host-page aligned (4 KiB guest pages on a
+  // 16 KiB host) can only lie inside an existing reservation: mmap would
+  // reject it with EINVAL rather than EEXIST, so go straight to the commit
+  // path below, which covers the enclosing host pages.
+  const bool host_misaligned =
+      base_address &&
+      ((reinterpret_cast<uintptr_t>(base_address) | length) & (page_size() - 1)) != 0;
+  void* result = host_misaligned ? MAP_FAILED
+                                 : mmap(base_address, length, prot_initial, flags, -1, 0);
   if (result != MAP_FAILED) {
     return result;
   }
 #if defined(MAP_FIXED_NOREPLACE) && REX_PLATFORM_LINUX
   // Handle EEXIST: address already has a mapping (e.g., from prior Reserve)
   // This is the "commit on existing reservation" path
-  if (errno == EEXIST && base_address &&
+  if ((host_misaligned || errno == EEXIST) && base_address &&
       (allocation_type == AllocationType::kCommit ||
        allocation_type == AllocationType::kReserveCommit)) {
     // Verify the entire range is mapped before using mprotect
-    if (IsRangeFullyMapped(base_address, length)) {
-      if (mprotect(base_address, length, static_cast<int>(prot_requested)) == 0) {
+    const auto host_range = AlignOutToHostPages(base_address, length);
+    if (IsRangeFullyMapped(host_range.base, host_range.length)) {
+      if (mprotect(host_range.base, host_range.length, static_cast<int>(prot_requested)) == 0) {
         return base_address;
       }
     }
@@ -259,12 +300,18 @@ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_ty
 bool DeallocFixed(void* base_address, size_t length, DeallocationType deallocation_type) {
   switch (deallocation_type) {
     case DeallocationType::kDecommit: {
-      // Decommit: remove access first, then release physical pages
-      if (mprotect(base_address, length, PROT_NONE) != 0) {
+      // Decommit: remove access first, then release physical pages. Only
+      // host pages lying wholly inside the range are touched: on a 16 KiB
+      // host a 4 KiB guest decommit must not discard its neighbours' data.
+      const auto host_range = AlignInToHostPages(base_address, length);
+      if (!host_range.length) {
+        return true;
+      }
+      if (mprotect(host_range.base, host_range.length, PROT_NONE) != 0) {
         return false;
       }
 #if defined(MADV_DONTNEED)
-      (void)madvise(base_address, length, MADV_DONTNEED);
+      (void)madvise(host_range.base, host_range.length, MADV_DONTNEED);
 #endif
       return true;
     }
@@ -298,7 +345,8 @@ bool Protect(void* base_address, size_t length, PageAccess access, PageAccess* o
 #endif
 
   uint32_t prot = ToPosixProtectFlags(access);
-  return mprotect(base_address, length, prot) == 0;
+  const auto host_range = AlignOutToHostPages(base_address, length);
+  return mprotect(host_range.base, host_range.length, prot) == 0;
 }
 
 bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
@@ -366,6 +414,22 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
       assert_always();
       return kFileMappingHandleInvalid;
   }
+#if REX_PLATFORM_GNU_LINUX
+  // A named /dev/shm object is only unlinked by CloseFileMappingHandle, so
+  // every crashed or killed run leaked its ~4.5 GB (sparse) guest memory file
+  // until tmpfs filled and guest writes died with SIGBUS. An anonymous memfd
+  // is freed by the kernel with its last reference.
+  (void)oflag;
+  int ret = memfd_create(path.filename().c_str(), MFD_CLOEXEC);
+  if (ret < 0) {
+    return kFileMappingHandleInvalid;
+  }
+  if (ftruncate64(ret, static_cast<off_t>(length)) != 0) {
+    close(ret);
+    return kFileMappingHandleInvalid;
+  }
+  return static_cast<FileMappingHandle>(ret);
+#else
   oflag |= O_CREAT;
   auto full_path = MakeShmName(path);
   int ret = shm_open(full_path.c_str(), oflag, 0777);
@@ -379,11 +443,12 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
   }
   return static_cast<FileMappingHandle>(ret);
 #endif
+#endif
 }
 
 void CloseFileMappingHandle(FileMappingHandle handle, const std::filesystem::path& path) {
   close(static_cast<int>(handle));
-#if !REX_PLATFORM_ANDROID
+#if !REX_PLATFORM_ANDROID && !REX_PLATFORM_GNU_LINUX
   auto full_path = MakeShmName(path);
   shm_unlink(full_path.c_str());
 #endif

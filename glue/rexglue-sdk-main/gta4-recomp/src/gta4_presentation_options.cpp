@@ -12,6 +12,9 @@ REXCVAR_DEFINE_BOOL(
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(gta4_disable_tlad_film_grain, false, "GTA IV/Frontend",
                     "Use TLAD's grain-free composite passes; no effect in other episodes");
+REXCVAR_DEFINE_BOOL(gta4_motion_blur, true, "GTA IV/Graphics/Post-Processing",
+                    "Directional motion blur in the stock composite; off selects the title's "
+                    "blur-free composite pass");
 REXCVAR_DEFINE_BOOL(gta4_trace_presentation_options, false, "GTA IV/Diagnostics",
                     "Bounded startup presentation and TLAD composite-pass events")
     .debug_only();
@@ -20,6 +23,7 @@ namespace gta4::presentation {
 namespace {
 std::atomic<bool> skip_intro{false};
 std::atomic<bool> disable_grain{false};
+std::atomic<bool> motion_blur{true};
 std::atomic<bool> trace{false};
 std::once_flag callbacks;
 bool ParseBool(std::string_view value) noexcept {
@@ -35,6 +39,10 @@ void InitializeOptions() {
         "gta4_disable_tlad_film_grain", [](std::string_view, std::string_view value) {
           disable_grain.store(ParseBool(value), std::memory_order_relaxed);
         });
+    rex::cvar::RegisterChangeCallback(
+        "gta4_motion_blur", [](std::string_view, std::string_view value) {
+          motion_blur.store(ParseBool(value), std::memory_order_relaxed);
+        });
     rex::cvar::RegisterChangeCallback("gta4_trace_presentation_options",
                                       [](std::string_view, std::string_view value) {
                                         trace.store(ParseBool(value), std::memory_order_relaxed);
@@ -44,6 +52,8 @@ void InitializeOptions() {
                    std::memory_order_relaxed);
   disable_grain.store(ParseBool(rex::cvar::GetFlagByName("gta4_disable_tlad_film_grain")),
                       std::memory_order_relaxed);
+  motion_blur.store(ParseBool(rex::cvar::GetFlagByName("gta4_motion_blur")),
+                    std::memory_order_relaxed);
   trace.store(ParseBool(rex::cvar::GetFlagByName("gta4_trace_presentation_options")),
               std::memory_order_relaxed);
 }
@@ -53,6 +63,9 @@ bool SkipIntroAtLaunch() noexcept {
 }
 bool DisableTladFilmGrain() noexcept {
   return disable_grain.load(std::memory_order_relaxed);
+}
+bool MotionBlurEnabled() noexcept {
+  return motion_blur.load(std::memory_order_relaxed);
 }
 bool TraceEnabled() noexcept {
   return trace.load(std::memory_order_relaxed);

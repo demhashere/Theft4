@@ -1,0 +1,34 @@
+# Example ~/.local/share/LibertyRecomp/native.toml for an Apple M2 (8 GB,
+# fanless MacBook Air) under Asahi Linux. The in-game Advanced graphics menu
+# rewrites this file when you choose Save.
+
+# Render at 1707x960 (16:9) and scale up with plain bilinear: no FSR edge
+# reconstruction (which looks painterly on aliased input), no AA, no dither.
+gta4_aspect_ratio = "16:9"
+gta4_native_upscaler = "bilinear"
+gta4_fsr1_quality = "quality"
+gta4_native_anti_aliasing = "off"
+gta4_native_msaa = "off"
+gta4_native_output_dither = false
+gta4_motion_blur = false
+gta4_anisotropic_filtering = "4x"
+
+# Console-like cost (the iOS build's defaults).
+gta4_reflection_resolution = "original"
+gta4_shadow_map_base_size = 256
+gta4_shadow_distance_scale = 0.75
+gta4_force_highest_lod = false
+gta4_draw_distance_scale = 1.0
+gta4_drawable_reference_limit = 13000
+
+# Renderer CPU switches the iOS build ships with.
+gta4_native_async_pipeline_no_wait = true
+gta4_native_texture_content_cache = true
+gta4_native_sparse_texture_walks = true
+gta4_native_pipeline_snapshot_reuse = true
+gta4_native_component_scope_reuse = true
+clock_direct_reads = true
+
+# Fanless machines: a 30 fps cap keeps the SoC under its sustained power limit
+# instead of alternating between full speed and hard throttling.
+# gta4_frame_limit = 30

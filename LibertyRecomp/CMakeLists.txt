@@ -1576,6 +1576,11 @@ endif()
 # CURL — desktop only
 if (LIBERTY_RECOMP_HAS_CURL)
     target_link_libraries(LibertyRecomp PRIVATE CURL::libcurl)
+    # The RPF extractor's AES decryption uses OpenSSL on Linux.
+    if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID)
+        find_package(OpenSSL REQUIRED COMPONENTS Crypto)
+        target_link_libraries(LibertyRecomp PRIVATE OpenSSL::Crypto)
+    endif()
 else()
     target_compile_definitions(LibertyRecomp PRIVATE LIBERTY_RECOMP_NO_CURL)
 endif()

@@ -5,5 +5,6 @@ namespace gta4::presentation {
 void InitializeOptions();
 bool SkipIntroAtLaunch() noexcept;
 bool DisableTladFilmGrain() noexcept;
+bool MotionBlurEnabled() noexcept;
 bool TraceEnabled() noexcept;
 }  // namespace gta4::presentation

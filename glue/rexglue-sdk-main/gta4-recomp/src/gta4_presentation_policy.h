@@ -109,6 +109,16 @@ constexpr IntroPlan CollapseIntro(std::span<uint8_t> data, uint32_t count, bool 
   return plan;
 }
 
+// TU8 sub_822CFC00 selects base+11 with directional blur and base+10 without
+// it; the base keeps DOF (0/2), noise (14/16) or the alternate composite (18).
+// Never clear arbitrary odd-numbered passes (same mapping as the iOS setting).
+constexpr uint32_t WithoutMotionBlur(uint32_t pass) noexcept {
+  switch (pass) {
+    case 11: case 13: case 25: case 27: case 29: return pass - 1;
+    default: return pass;
+  }
+}
+
 constexpr bool IsNoisePass(uint32_t pass) noexcept {
   return pass == 24 || pass == 25 || pass == 26 || pass == 27;
 }

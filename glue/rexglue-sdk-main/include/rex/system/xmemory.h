@@ -28,11 +28,12 @@ class ByteStream;
 
 namespace rex::memory::detail {
 
-/// Compensates for Windows 64KB allocation granularity on the 0xE0 physical heap.
-/// The backing file maps the 0xE0 heap at a 0x1000-byte offset, but MapViewOfFileEx
-/// rounds down to 64KB boundaries. Linux mmap handles 4KB offsets natively.
+/// Compensates for host mapping granularity above 4KB on the 0xE0 physical heap.
+/// The backing file maps the 0xE0 heap at a 0x1000-byte offset, but the view can
+/// only start on a host granularity boundary (64KB on Windows, 16KB on Apple
+/// Silicon and Asahi Linux). See REX_EMULATED_PHYS_HOST_OFFSET.
 constexpr u32 PhysicalHostOffset([[maybe_unused]] u32 guest_addr) noexcept {
-#if REX_PLATFORM_WIN32 || REX_PLATFORM_DARWIN
+#if REX_EMULATED_PHYS_HOST_OFFSET
   return (guest_addr >= 0xE0000000u) ? 0x1000u : 0u;
 #else
   return 0u;
