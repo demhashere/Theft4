@@ -6,6 +6,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <unordered_set>
 #include <vector>
@@ -22,6 +23,7 @@
 #include <rex/system/xam/content_manager.h>
 #include <rex/system/xam/live_compatibility.h>
 #include <rex/system/xam/user_profile.h>
+#include <rex/thread/runtime_wait_policy.h>
 #include <rex/ui/flags.h>
 #include <rex/ui/keybinds.h>
 #include <rex/ui/window.h>
@@ -625,6 +627,12 @@ void GTA4App::OnPreSetup(rex::RuntimeConfig& config) {
                            "THEFT4_XMA_INLINE", "THEFT4_HARDWARE_SMAA", "THEFT4_FUSED_SMAA"}) {
     setenv(name, "1", 0);
   }
+  // Notification-based multi-object waits instead of 1 ms polling. Latched
+  // here, before the kernel creates guest threads; off unless set to 1.
+  const char* wait_fixes = std::getenv("THEFT4_RUNTIME_WAIT_FIXES");
+  rex::thread::ConfigureRuntimeWaitFixes(wait_fixes && std::strcmp(wait_fixes, "1") == 0);
+  REXLOG_INFO("Theft4 runtime waits: fixes={} (THEFT4_RUNTIME_WAIT_FIXES)",
+              rex::thread::RuntimeWaitFixesEnabled());
 #endif
   rex::input::mnk::SetNativeControllerCompatibilityBindings(
       gta4::input::KeyboardControllerBindings());
