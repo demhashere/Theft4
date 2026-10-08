@@ -2421,6 +2421,7 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
   uint64_t upload_plan_epoch_ = 0;
   NativePeriodicWorkSchedule host_memory_poll_schedule_{0};
   uint32_t host_memory_warning_frame_ = 0;
+  uint32_t host_memory_warning_interval_ = 600;
   bool host_memory_warning_sent_ = false;
   uint64_t command_pool_reset_count_ = 0;
   VkPipelineLayout pipeline_layout_ = VK_NULL_HANDLE;

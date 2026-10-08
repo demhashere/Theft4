@@ -13093,7 +13093,8 @@ memory::Snapshot Gta4NativeGraphicsSystem::CollectNativeMemorySnapshot(uint32_t 
   set_usage(memory::Category::kGpuNullResources, null_bytes, null_bytes, null_count);
 
   const NativeTextureHeapBudgets budgets = QueryNativeTextureHeapBudgets();
-  if (budgets.available) {
+  // Driver-reported heaps only; a host-derived texture budget is not heap usage.
+  if (budgets.available && !budgets.host_fallback) {
     for (uint32_t heap = 0; heap < budgets.heap_count; ++heap) {
       snapshot.vulkan_heap_usage_bytes += budgets.usage[heap];
       snapshot.vulkan_heap_budget_bytes += budgets.budget[heap];
@@ -18236,17 +18237,24 @@ void Gta4NativeGraphicsSystem::PollHostMemoryPressure(uint32_t frame) {
   const bool low_available = host.mem_available_valid && host.mem_available_bytes < reserve;
   const bool stalled = host.psi_valid &&
       host.psi_some_avg10 >= REXCVAR_GET(gta4_native_host_memory_psi_percent);
-  if (!low_available && !stalled) return;
-  // One request per 600 frames: recovery itself runs for 120 title presents,
-  // and PSI avg10 decays over ten seconds after the trim relieves the host.
+  if (!low_available && !stalled) {
+    host_memory_warning_interval_ = 600;
+    return;
+  }
+  // Recovery runs for 120 title presents and PSI avg10 decays over ten
+  // seconds, so wait 600 frames between requests. If pressure persists
+  // anyway, trimming the renderer is not relieving it: back off (doubling to
+  // 9600 frames) until a poll sees the host recover.
   if (host_memory_warning_sent_ && frame >= host_memory_warning_frame_ &&
-      frame - host_memory_warning_frame_ < 600) return;
+      frame - host_memory_warning_frame_ < host_memory_warning_interval_) return;
+  if (host_memory_warning_sent_) host_memory_warning_interval_ =
+      std::min<uint32_t>(host_memory_warning_interval_ * 2, 9600);
   host_memory_warning_sent_ = true;
   host_memory_warning_frame_ = frame;
   light::memory_warnings.fetch_add(1, std::memory_order_relaxed);
   REXLOG_INFO("gta4-native-memory: host pressure frame={} mem-available-mib={} psi-some-avg10={:.2f} "
-              "recovery={}", frame, host.mem_available_bytes / 1048576, host.psi_some_avg10,
-              NativeMemoryRecoveryEnabled());
+              "recovery={} next-interval={}", frame, host.mem_available_bytes / 1048576,
+              host.psi_some_avg10, NativeMemoryRecoveryEnabled(), host_memory_warning_interval_);
 }
 
 void Gta4NativeGraphicsSystem::DestroyNativeTextureImage(NativeTextureImage& image) {
