@@ -3,6 +3,7 @@
 This branch (`linux-arm64-asahi`) ports the Graine desktop app
 (`glue/rexglue-sdk-main/gta4-recomp`) to Linux arm64. Read `LINUX_PORT.md`
 first: it lists every change, the build commands and the known issues.
+For performance work read `linux/PERFORMANCE.md` (measurements and targets).
 
 ## The machine
 
