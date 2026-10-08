@@ -429,6 +429,11 @@ REXCVAR_DEFINE_BOOL(
     "persistent vertex/index buffers (filled through their own mapping, as on MoltenVK), and "
     "check each bound texture once per frame");
 REXCVAR_DEFINE_BOOL(
+    gta4_native_cached_constant_arena, false, "GTA IV/Graphics/Native Renderer",
+    "Allocate frame constant arenas from host-cached memory when the driver offers it; the CPU "
+    "reads delta parents and masked bases back from the arena")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(
     gta4_native_skip_identity_restart_rewrite, false, "GTA IV/Graphics/Native Renderer",
     "Bind 16-bit strip indices directly when the guest restart index is already 0xFFFF instead "
     "of copying them through frame staging every draw");
@@ -9452,7 +9457,8 @@ void Gta4NativeGraphicsSystem::DestroyShaderResources() {
 }
 
 bool Gta4NativeGraphicsSystem::CreateNativeUploadBuffer(VkDeviceSize capacity,
-                                                        NativeUploadBuffer& upload_buffer) {
+                                                        NativeUploadBuffer& upload_buffer,
+                                                        bool prefer_cached) {
   auto* vulkan_provider = static_cast<ui::vulkan::VulkanProvider*>(provider_.get());
   const ui::vulkan::VulkanDevice* vulkan_device =
       vulkan_provider ? vulkan_provider->vulkan_device() : nullptr;
@@ -9477,6 +9483,19 @@ bool Gta4NativeGraphicsSystem::CreateNativeUploadBuffer(VkDeviceSize capacity,
   dfn.vkGetBufferMemoryRequirements(device, upload_buffer.buffer, &requirements);
   upload_buffer.memory_type = ui::vulkan::util::ChooseHostMemoryType(
       vulkan_device->memory_types(), requirements.memoryTypeBits, false);
+  if (prefer_cached) {
+    // Constant arenas are read back by the CPU (delta parents, masked bases);
+    // uncached write-combined reads are slow. Prefer cached and coherent; a
+    // non-coherent type is still flushed before submission.
+    const auto& types = vulkan_device->memory_types();
+    const uint32_t cached =
+        requirements.memoryTypeBits & types.host_visible & types.host_cached;
+    uint32_t chosen = UINT32_MAX;
+    if (rex::bit_scan_forward(cached & types.host_coherent, &chosen) ||
+        rex::bit_scan_forward(cached, &chosen)) {
+      upload_buffer.memory_type = chosen;
+    }
+  }
   if (upload_buffer.memory_type == UINT32_MAX) {
     DestroyNativeUploadBuffer(upload_buffer);
     return false;
@@ -10104,7 +10123,8 @@ bool Gta4NativeGraphicsSystem::EnsureFrameConstantArenaCapacity() {
       return false;
     }
     NativeUploadBuffer replacement{};
-    if (!CreateNativeUploadBuffer(desired_capacity, replacement)) {
+    if (!CreateNativeUploadBuffer(desired_capacity, replacement,
+                                  REXCVAR_GET(gta4_native_cached_constant_arena))) {
       return false;
     }
     replacement.write_offset = 0;
