@@ -447,11 +447,17 @@ class PosixConditionBase {
     const auto deadline = Deadline(timeout);
 
     // Acquire object locks in a stable order, but choose/consume signals in
-    // caller order. Reject duplicate handles instead of locking a mutex twice.
+    // caller order. NT accepts duplicates for WaitAny (lock each object once);
+    // WaitAll would consume a duplicated object twice, so reject it there.
     auto ordered = handles;
     std::sort(ordered.begin(), ordered.end(), std::less<PosixConditionBase*>());
-    if (std::adjacent_find(ordered.begin(), ordered.end()) != ordered.end()) {
-      return {WaitResult::kFailed, 0};
+    if (wait_all) {
+      if (std::adjacent_find(ordered.begin(), ordered.end()) != ordered.end()) {
+        return {WaitResult::kFailed, 0};
+      }
+    } else {
+      ordered.erase(std::unique(ordered.begin(), ordered.end()), ordered.end());
+      if (ordered.size() == 1) return {ordered[0]->Wait(timeout), 0};
     }
     MultiWaitWakeState wake;
     struct Registration {
@@ -490,12 +496,21 @@ class PosixConditionBase {
       if (!all_locked) {
         unlock_all();
         const auto now = SteadyClock::now();
-        if (now >= deadline) return {WaitResult::kTimeout, 0};
-        // Mutex release itself is not a signal. Bound this rare admission
-        // retry independently of object notifications, without busy yielding.
-        std::this_thread::sleep_until(std::min(deadline, now + contention_backoff));
-        contention_backoff = std::min(contention_backoff * 2, std::chrono::microseconds(1000));
-        continue;
+        if (now < deadline) {
+          // Mutex release itself is not a signal. Bound this rare admission
+          // retry independently of object notifications, without busy yielding.
+          std::this_thread::sleep_until(std::min(deadline, now + contention_backoff));
+          contention_backoff = std::min(contention_backoff * 2, std::chrono::microseconds(1000));
+          continue;
+        }
+        // A zero or expired wait must still check the objects once: a mutex
+        // held for a moment by a signaler is not a timeout. Block in the same
+        // address order every multi-object locker uses; every other path
+        // holds one object mutex plus at most the leaf wake mutex.
+        for (auto& lock : locks) {
+          LockObject(*lock.mutex());
+          lock = std::unique_lock<std::mutex>(*lock.mutex(), std::adopt_lock);
+        }
       }
       size_t first = handles.size();
       bool ready = wait_all;

@@ -63,9 +63,12 @@ TEST_CASE("Corrected WaitAny honours timeouts and duplicate handles", "[thread][
   const auto begin = std::chrono::steady_clock::now();
   REQUIRE(thread::WaitAny(handles, false, 30ms).first == thread::WaitResult::kTimeout);
   REQUIRE(std::chrono::steady_clock::now() - begin >= 30ms);
-  std::vector<thread::WaitHandle*> duplicate{a.get(), a.get()};
-  REQUIRE(thread::WaitAny(duplicate, false, 0ms).first == thread::WaitResult::kFailed);
+  // NT accepts duplicate objects for WaitAny; WaitAll rejects them.
+  std::vector<thread::WaitHandle*> duplicate{a.get(), a.get(), b.get()};
+  REQUIRE(thread::WaitAny(duplicate, false, 0ms).first == thread::WaitResult::kTimeout);
+  REQUIRE(thread::WaitAll(duplicate, false, 0ms) == thread::WaitResult::kFailed);
   a->Set();
+  REQUIRE(thread::WaitAny(duplicate, false, 0ms).second == 0);
   // Manual reset stays signaled; the first signaled handle in caller order wins.
   b->Set();
   REQUIRE(thread::WaitAny(handles, false, 0ms).second == 0);
@@ -130,4 +133,24 @@ TEST_CASE("Corrected waits acquire a released mutant", "[thread][wait-fixes]") {
   REQUIRE(result.second == 1);
   REQUIRE(mutant->Release());
   REQUIRE_FALSE(mutant->Release());
+}
+
+TEST_CASE("Corrected zero-timeout polls see a signaled object despite contention",
+          "[thread][wait-fixes]") {
+  UseCorrectedWaits();
+  // A signaler briefly holding an object mutex is not a timeout.
+  auto ready = thread::Event::CreateManualResetEvent(true);
+  auto busy = thread::Event::CreateManualResetEvent(false);
+  std::atomic<bool> stop{false};
+  std::thread signaler([&] {
+    while (!stop) { busy->Set(); busy->Reset(); }
+  });
+  std::vector<thread::WaitHandle*> handles{ready.get(), busy.get()};
+  int timeouts = 0;
+  for (int i = 0; i < 100000; ++i) {
+    timeouts += thread::WaitAny(handles, false, 0ms).first == thread::WaitResult::kTimeout;
+  }
+  stop = true;
+  signaler.join();
+  REQUIRE(timeouts == 0);
 }
