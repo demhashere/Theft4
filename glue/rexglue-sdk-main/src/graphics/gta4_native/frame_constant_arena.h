@@ -72,13 +72,33 @@ class FrameGenerationMap {
   }
 
   InsertResult Insert(const Key& key, const Value& value) {
-    if (Value* existing = Find(key)) {
-      return {existing, false};
+    // One hash and one probe sequence: without deletions, the first stale
+    // bucket ends the lookup and is also where the key belongs, unless the
+    // table must grow first.
+    const size_t hash = BucketHash(key);
+    if (!buckets_.empty()) {
+      const size_t mask = buckets_.size() - 1;
+      size_t index = hash & mask;
+      for (size_t probe = 0; probe < buckets_.size(); ++probe) {
+        Bucket& bucket = buckets_[index];
+        if (bucket.generation != generation_) {
+          if (size_ >= buckets_.size() / 2) break;
+          bucket.key = key;
+          bucket.value = value;
+          bucket.generation = generation_;
+          ++size_;
+          return {&bucket.value, true};
+        }
+        if (equal_(bucket.key, key)) {
+          return {&bucket.value, false};
+        }
+        index = (index + 1) & mask;
+      }
     }
     if (!EnsureInsertionCapacity()) {
       return {};
     }
-    Bucket* bucket = InsertWithoutGrowth(key, value);
+    Bucket* bucket = InsertWithoutGrowth(key, value, hash);
     if (!bucket) {
       return {};
     }
@@ -163,19 +183,19 @@ class FrameGenerationMap {
     size_ = 0;
     for (const Bucket& bucket : previous) {
       if (bucket.generation == previous_generation &&
-          !InsertWithoutGrowth(bucket.key, bucket.value)) {
+          !InsertWithoutGrowth(bucket.key, bucket.value, BucketHash(bucket.key))) {
         return false;
       }
     }
     return size_ == previous_size;
   }
 
-  Bucket* InsertWithoutGrowth(const Key& key, const Value& value) {
+  Bucket* InsertWithoutGrowth(const Key& key, const Value& value, size_t hash) {
     if (buckets_.empty()) {
       return nullptr;
     }
     const size_t mask = buckets_.size() - 1;
-    size_t index = BucketHash(key) & mask;
+    size_t index = hash & mask;
     for (size_t probe = 0; probe < buckets_.size(); ++probe) {
       Bucket& bucket = buckets_[index];
       if (bucket.generation != generation_) {

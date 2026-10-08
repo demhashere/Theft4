@@ -5,8 +5,10 @@
 #include <memory>
 #include <random>
 #include <span>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include "graphics/gta4_native/frame_constant_arena.h"
 #include "graphics/gta4_native/native_immutable_bindings.h"
 #include "graphics/gta4_native/native_prepared_bindings.h"
 #include "graphics/gta4_native/native_profile_shader_category.h"
@@ -262,4 +264,33 @@ TEST_CASE("Shader diagnostic fallback classifies shadows without mutating runtim
   REQUIRE(ProfileShaderCategory("shader/rage_shaders/gta_default/gta_default_vs0.bin","")==GpuRange::kMaterialShaders);
   REQUIRE(ProfileShaderCategory("something-new", "something-new")==GpuRange::kUnattributed);
   REQUIRE(ProfileShaderCategory("", "shader/rage_shaders/rage_postfx_e2.fxc")==GpuRange::kComposite);
+}
+
+TEST_CASE("frame generation map single-probe insert matches a reference map",
+          "[gta4-native][hotpath]") {
+  // Insert finds or places a key in one probe sequence; compare it with a
+  // reference map across growth, generation resets and repeated keys.
+  rex::graphics::gta4_native::FrameGenerationMap<uint64_t, uint32_t> map;
+  std::unordered_map<uint64_t, uint32_t> reference;
+  uint64_t state = 0x9E3779B97F4A7C15ull;
+  for (uint32_t step = 0; step < 200000; ++step) {
+    state = state * 6364136223846793005ull + 1442695040888963407ull;
+    if (step % 20000 == 19999) {
+      REQUIRE(map.ResetGeneration());
+      reference.clear();
+      continue;
+    }
+    const uint64_t key = (state >> 33) % 4096;
+    const auto result = map.Insert(key, step);
+    REQUIRE(result);
+    const auto [it, inserted] = reference.emplace(key, step);
+    REQUIRE(result.inserted == inserted);
+    REQUIRE(*result.value == it->second);
+    REQUIRE(map.size() == reference.size());
+    const uint64_t probe = (state >> 7) % 4096;
+    const uint32_t* found = map.Find(probe);
+    const auto expected = reference.find(probe);
+    REQUIRE((found != nullptr) == (expected != reference.end()));
+    if (found) REQUIRE(*found == expected->second);
+  }
 }
