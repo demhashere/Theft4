@@ -183,3 +183,27 @@ TEST_CASE("filtered geometry commands match unconditional draw state across fram
   // This synthetic workload demonstrates suppression, not an FPS prediction.
   REQUIRE(emitted_binds < requested_binds / 10);
 }
+
+TEST_CASE("uniform dynamic state survives title pipeline switches until an external Reset",
+          "[gta4-native][draw-state]") {
+  // THEFT4_RENDERER_EFFICIENCY: every title pipeline declares the same dynamic
+  // states, so switching between them keeps the emitted values valid.
+  Cache cache;
+  Draw draw;
+  REQUIRE(cache.UpdatePipeline(draw.pipeline, true));
+  REQUIRE(cache.UpdateViewport(draw.viewport));
+  REQUIRE(cache.UpdateStencil(draw.stencil));
+  REQUIRE(cache.UpdatePushConstants(draw.layout, draw.constants));
+  REQUIRE(cache.UpdatePipeline(2, true));
+  REQUIRE_FALSE(cache.UpdateViewport(draw.viewport));
+  REQUIRE_FALSE(cache.UpdateStencil(draw.stencil));
+  REQUIRE_FALSE(cache.UpdatePushConstants(draw.layout, draw.constants));
+  // Without the flag a pipeline switch forgets every dynamic value.
+  REQUIRE(cache.UpdatePipeline(3, false));
+  REQUIRE(cache.UpdateViewport(draw.viewport));
+  REQUIRE(cache.UpdateStencil(draw.stencil));
+  // A helper pipeline (SMAA, resolve, present) must Reset the cache.
+  cache.Reset();
+  REQUIRE(cache.UpdatePipeline(3, true));
+  REQUIRE(cache.UpdateViewport(draw.viewport));
+}

@@ -938,6 +938,11 @@ bool NativeRendererEfficiencyEnabled() {
     return !setting || std::strcmp(setting, "0") != 0;
   }();
   return enabled;
+#elif defined(THEFT4_LAB_BUILD) && defined(__linux__)
+  // The sparse texture-stage walk only applies with the indexed working-set
+  // descriptor backend ("backend=indexed-working-set" in the log).
+  static const bool enabled = NativeLinuxSwitchRequested("THEFT4_RENDERER_EFFICIENCY");
+  return enabled;
 #else
   return false;
 #endif
@@ -1083,6 +1088,10 @@ bool NativeMemoryRecoveryEnabled() {
     const char* setting = std::getenv("THEFT4_MEMORY_RECOVERY");
     return !setting || std::strcmp(setting, "0") != 0;
   }();
+  return enabled;
+#elif defined(THEFT4_LAB_BUILD) && defined(__linux__)
+  // Warnings come from gta4_native_host_memory_warnings on Linux.
+  static const bool enabled = NativeLinuxSwitchRequested("THEFT4_MEMORY_RECOVERY");
   return enabled;
 #else
   return false;
@@ -28929,6 +28938,8 @@ bool Gta4NativeGraphicsSystem::RecordPresent(
         shader_source_image, shader_source_view, *shader_source_layout,
         {shader_source_width, shader_source_height}, quality, smaa_output, timing, nullptr, smaa_linear_view);
     capture_hardware_path();
+    // The SMAA passes bind their own pipelines and dynamic state.
+    native_draw_state_cache_.Reset();
     if (smaa_applied) {
       shader_source_image = smaa_output.image;
       shader_source_view = smaa_output.view;
