@@ -627,12 +627,19 @@ void GTA4App::OnPreSetup(rex::RuntimeConfig& config) {
                            "THEFT4_XMA_INLINE", "THEFT4_HARDWARE_SMAA", "THEFT4_FUSED_SMAA"}) {
     setenv(name, "1", 0);
   }
-  // Notification-based multi-object waits instead of 1 ms polling. Latched
-  // here, before the kernel creates guest threads; off unless set to 1.
+  // The iOS runtime-wait bundle: notification-based multi-object waits
+  // instead of 1 ms polling, microsecond guest delays, rounded-up and absolute
+  // wait timeouts, and guest-increment thread priorities. Alertable waits keep
+  // their 1 ms slices. Latched here, before the kernel creates guest threads;
+  // off unless set to 1.
   const char* wait_fixes = std::getenv("THEFT4_RUNTIME_WAIT_FIXES");
   rex::thread::ConfigureRuntimeWaitFixes(wait_fixes && std::strcmp(wait_fixes, "1") == 0);
-  REXLOG_INFO("Theft4 runtime waits: fixes={} (THEFT4_RUNTIME_WAIT_FIXES)",
-              rex::thread::RuntimeWaitFixesEnabled());
+  const bool wait_fixes_enabled = rex::thread::RuntimeWaitFixesEnabled();
+  REXLOG_INFO("Theft4 runtime waits: fixes={} multiwait={} guest-delay={} guest-priority={} "
+              "(THEFT4_RUNTIME_WAIT_FIXES)", wait_fixes_enabled,
+              wait_fixes_enabled ? "object-notification" : "1ms-polling",
+              wait_fixes_enabled ? "microsecond-deadline" : "millisecond",
+              wait_fixes_enabled ? "guest-increment" : "host-query");
 #endif
   rex::input::mnk::SetNativeControllerCompatibilityBindings(
       gta4::input::KeyboardControllerBindings());
