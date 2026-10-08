@@ -346,6 +346,8 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
     std::shared_ptr<const NativeTextureResource> packed_depth_source;
     bool vector_font_replacement = false;
     uint32_t vector_font_id = 0;
+    // Render worker only: EnsureFrameUploadCapacity's per-frame visit stamp.
+    mutable uint64_t upload_plan_epoch = 0;
   };
 
   struct SynchronousCommand {
@@ -2415,6 +2417,7 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
   // Linux PSI/MemAvailable source for the memory warnings above.
   void PollHostMemoryPressure(uint32_t frame);
   NativeTextureHeapBudgets QueryHostTextureHeapBudgets() const;
+  uint64_t upload_plan_epoch_ = 0;
   NativePeriodicWorkSchedule host_memory_poll_schedule_{0};
   uint32_t host_memory_warning_frame_ = 0;
   bool host_memory_warning_sent_ = false;

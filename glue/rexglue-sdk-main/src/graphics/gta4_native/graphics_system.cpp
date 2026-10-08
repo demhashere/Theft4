@@ -424,9 +424,10 @@ REXCVAR_DEFINE_UINT32(
     gta4_native_texture_memory_limit_mb, 0, "GTA IV/Graphics/Native Renderer",
     "Optional native texture heap budget cap in MiB (0 uses the Vulkan driver budget)");
 REXCVAR_DEFINE_BOOL(
-    gta4_native_unified_upload_planning, false, "GTA IV/Graphics/Native Renderer",
-    "On unified-memory drivers, skip planning frame staging space for persistent vertex and "
-    "index buffers, which are filled through their own mapping (as on MoltenVK)");
+    gta4_native_lean_upload_planning, false, "GTA IV/Graphics/Native Renderer",
+    "Cheaper per-frame upload planning: on unified-memory drivers skip staging plans for "
+    "persistent vertex/index buffers (filled through their own mapping, as on MoltenVK), and "
+    "check each bound texture once per frame");
 REXCVAR_DEFINE_BOOL(
     gta4_native_host_memory_budget, false, "GTA IV/Graphics/Native Renderer",
     "Without VK_EXT_memory_budget (Honeykrisp), derive the texture budget from host "
@@ -17872,16 +17873,27 @@ bool Gta4NativeGraphicsSystem::EnsureFrameUploadCapacity(
     required_capacity = aligned_offset + size;
   };
 
+  const bool lean_planning = REXCVAR_GET(gta4_native_lean_upload_planning);
+  const uint64_t plan_epoch = ++upload_plan_epoch_;
   std::unordered_set<uint64_t> pending_texture_generations;
-  auto add_texture = [&](const std::shared_ptr<const NativeTextureResource>& texture) {
-    if (!texture || texture->gpu_produced || texture->payload.empty() ||
+  // Raw pointers: frame records hold their owners, and converting a frame
+  // resource ref to shared_ptr costs two atomics per binding.
+  auto add_texture = [&](const NativeTextureResource* texture) {
+    if (!texture) return;
+    // Nothing below changes during planning, so later bindings of the same
+    // resource cannot add anything.
+    if (lean_planning) {
+      if (texture->upload_plan_epoch == plan_epoch) return;
+      texture->upload_plan_epoch = plan_epoch;
+    }
+    if (texture->gpu_produced || texture->payload.empty() ||
         native_texture_images_.contains(texture->generation) ||
         !pending_texture_generations.insert(texture->generation).second) {
       return;
     }
     add_allocation(VkDeviceSize(texture->payload.size()), 16);
   };
-  add_texture(present_source);
+  add_texture(present_source.get());
 
   using VertexUploadKey =
       std::tuple<const NativeBufferResource*, uint64_t, uint64_t, uint32_t, uint32_t, uint32_t>;
@@ -17893,15 +17905,15 @@ bool Gta4NativeGraphicsSystem::EnsureFrameUploadCapacity(
   // unified-memory driver such as Honeykrisp too). A rare unplanned staging
   // fallback grows an overflow block in AllocateUpload.
   const auto& upload_memory_types = vulkan_device->memory_types();
-  const bool unified_persistent_blocks = REXCVAR_GET(gta4_native_unified_upload_planning) &&
+  const bool unified_persistent_blocks = lean_planning &&
       (upload_memory_types.device_local & upload_memory_types.host_visible) != 0;
   const bool persistent_direct_upload = persistent_buffers_enabled &&
       (vulkan_device->properties().driverID == VK_DRIVER_ID_MOLTENVK || unified_persistent_blocks);
   const bool sparse_texture_walks = REXCVAR_GET(gta4_native_sparse_texture_walks);
   uint32_t draw_count = 0;
   for (const NativeCommand& command : current_frame_) {
-    add_texture(command.resolve_destination);
-    add_texture(command.depth_handoff_source);
+    add_texture(command.resolve_destination.get());
+    add_texture(command.depth_handoff_source.get());
     const bool is_draw = command.type == CommandType::kDrawPrimitive ||
                          command.type == CommandType::kDrawPrimitiveUp ||
                          command.type == CommandType::kDrawIndexedPrimitive;
@@ -17909,11 +17921,11 @@ bool Gta4NativeGraphicsSystem::EnsureFrameUploadCapacity(
       uint32_t stages = command.used_texture_mask;
       while (stages) {
         const uint32_t stage = std::countr_zero(stages);
-        add_texture(command.textures[stage]);
+        add_texture(command.textures[stage].get());
         stages &= stages - 1;
       }
     } else {
-      for (const auto& texture : command.textures) add_texture(texture);
+      for (const auto& texture : command.textures) add_texture(texture.get());
     }
     if (!is_draw) {
       continue;
