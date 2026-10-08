@@ -12,6 +12,7 @@ add_executable(unit_tests
     core/stream_test.cpp
     core/byte_order_test.cpp
     core/chrono_test.cpp
+    core/wait_multiple_test.cpp
     audio/audio_conversion_test.cpp
     audio/audio_ring_test.cpp
     audio/audio_clock_test.cpp
@@ -37,6 +38,8 @@ add_executable(unit_tests
     graphics/shader_override_policy_test.cpp
     graphics/dirty_state_delta_test.cpp
     graphics/native_frame_scheduling_test.cpp
+    graphics/native_helper_thread_test.cpp
+    graphics/native_host_memory_test.cpp
     graphics/native_msaa_policy_test.cpp
     graphics/hdr_policy_test.cpp
     graphics/texture_filtering_policy_test.cpp

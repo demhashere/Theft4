@@ -1,16 +1,25 @@
 #pragma once
 #include <rex/chrono/clock.h>
+#include <atomic>
 #include <utility>
 #include "native_cpu_profile.h"
 
 namespace rex::graphics::gta4_native::profile {
 inline thread_local CpuRecorder* current_cpu_recorder = nullptr;
+// Number of threads with a recorder bound. The thread-local read goes through
+// a TLS descriptor call in a dlopen'd plugin; scopes skip it unless a capture
+// is bound somewhere (a thread's own binding is visible to itself in program
+// order, and every other thread's recorder is null anyway).
+inline std::atomic<uint32_t> bound_cpu_recorders{0};
+inline CpuRecorder* CurrentCpuRecorder() {
+  return bound_cpu_recorders.load(std::memory_order_relaxed) ? current_cpu_recorder : nullptr;
+}
 inline uint64_t CpuTick() {
   return rex::chrono::Clock::QueryHostTickCount();
 }
 class CpuScope {
  public:
-  explicit CpuScope(CpuOp op) : owner_(current_cpu_recorder) {
+  explicit CpuScope(CpuOp op) : owner_(CurrentCpuRecorder()) {
     if (owner_ && owner_->active())
       token_ = owner_->Enter(op, CpuTick());
   }
@@ -30,7 +39,7 @@ class CpuScope {
 };
 class CpuPhaseScope {
  public:
-  explicit CpuPhaseScope(CpuPhase phase) : owner_(current_cpu_recorder) {
+  explicit CpuPhaseScope(CpuPhase phase) : owner_(CurrentCpuRecorder()) {
     if (owner_)
       prior_ = owner_->SetPhase(phase);
   }
@@ -49,7 +58,7 @@ class CpuPhaseScope {
 };
 class CpuContextScope {
  public:
-  explicit CpuContextScope(CpuContext context) : owner_(current_cpu_recorder) {
+  explicit CpuContextScope(CpuContext context) : owner_(CurrentCpuRecorder()) {
     if (owner_)
       prior_ = owner_->SetContext(context);
   }
@@ -64,13 +73,19 @@ class CpuContextScope {
 };
 class CpuRecorderBinding {
  public:
-  explicit CpuRecorderBinding(CpuRecorder* recorder) : prior_(current_cpu_recorder) {
+  explicit CpuRecorderBinding(CpuRecorder* recorder)
+      : prior_(current_cpu_recorder), counted_(recorder != nullptr) {
+    if (counted_) bound_cpu_recorders.fetch_add(1, std::memory_order_relaxed);
     current_cpu_recorder = recorder;
   }
-  ~CpuRecorderBinding() { current_cpu_recorder = prior_; }
+  ~CpuRecorderBinding() {
+    current_cpu_recorder = prior_;
+    if (counted_) bound_cpu_recorders.fetch_sub(1, std::memory_order_relaxed);
+  }
 
  private:
   CpuRecorder* prior_;
+  bool counted_;
 };
 template <typename Fn>
 decltype(auto) CpuCall(CpuOp op, Fn&& fn) {

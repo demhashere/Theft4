@@ -18,8 +18,11 @@
 #if defined(__APPLE__)
 #include <unistd.h>
 #include <cerrno>
+#elif defined(__linux__)
+#include <pthread.h>
 #endif
 #include "native_cpu_profile_scope.h"
+#include "native_host_memory.h"
 #include "native_pass_stats.h"
 #include "native_profile_shader_category.h"
 #include "modern_shader_options.h"
@@ -420,6 +423,41 @@ REXCVAR_DEFINE_UINT32(
 REXCVAR_DEFINE_UINT32(
     gta4_native_texture_memory_limit_mb, 0, "GTA IV/Graphics/Native Renderer",
     "Optional native texture heap budget cap in MiB (0 uses the Vulkan driver budget)");
+REXCVAR_DEFINE_BOOL(
+    gta4_native_lean_upload_planning, false, "GTA IV/Graphics/Native Renderer",
+    "Cheaper per-frame upload planning: on unified-memory drivers skip staging plans for "
+    "persistent vertex/index buffers (filled through their own mapping, as on MoltenVK), and "
+    "check each bound texture once per frame");
+REXCVAR_DEFINE_BOOL(
+    gta4_native_cached_constant_arena, false, "GTA IV/Graphics/Native Renderer",
+    "Allocate frame constant arenas from host-cached memory when the driver offers it; the CPU "
+    "reads delta parents and masked bases back from the arena")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(
+    gta4_native_skip_identity_restart_rewrite, false, "GTA IV/Graphics/Native Renderer",
+    "Bind 16-bit strip indices directly when the guest restart index is already 0xFFFF instead "
+    "of copying them through frame staging every draw");
+REXCVAR_DEFINE_BOOL(
+    gta4_native_host_memory_budget, false, "GTA IV/Graphics/Native Renderer",
+    "Without VK_EXT_memory_budget (Honeykrisp), derive the texture budget from host "
+    "MemAvailable; under that pressure, textures unused for "
+    "gta4_native_host_memory_grace_frames are retired instead of after 600 frames");
+REXCVAR_DEFINE_UINT32(
+    gta4_native_host_memory_reserve_mb, 768, "GTA IV/Graphics/Native Renderer",
+    "Host memory (MiB of MemAvailable) the host budget and memory warnings keep free")
+    .range(0, 65536);
+REXCVAR_DEFINE_UINT32(
+    gta4_native_host_memory_grace_frames, 120, "GTA IV/Graphics/Native Renderer",
+    "Frames without use before a texture may be retired under host budget pressure")
+    .range(1, 600);
+REXCVAR_DEFINE_BOOL(
+    gta4_native_host_memory_warnings, false, "GTA IV/Graphics/Native Renderer",
+    "Raise renderer memory warnings from Linux PSI (/proc/pressure/memory) or MemAvailable "
+    "below the reserve; acted on only with THEFT4_MEMORY_RECOVERY=1");
+REXCVAR_DEFINE_DOUBLE(
+    gta4_native_host_memory_psi_percent, 10.0, "GTA IV/Graphics/Native Renderer",
+    "Memory PSI 'some avg10' percentage that counts as host memory pressure")
+    .range(0.1, 100.0);
 
 namespace rex::graphics::gta4_native {
 
@@ -898,6 +936,13 @@ extern "C" __attribute__((visibility("default"))) int rex_gta4_native_memory_pro
 
 namespace {
 
+// Linux reads the same THEFT4_* switches as the iOS launcher, but each one is
+// opt-in ("1") until it has been measured on Asahi; iOS defaults them on.
+[[maybe_unused]] bool NativeLinuxSwitchRequested(const char* name) {
+  const char* value = std::getenv(name);
+  return value && std::strcmp(value, "1") == 0;
+}
+
 // Latched before the first gameplay command; a fresh launch applies changes.
 // Shared by the draw encoder, descriptor preparation and attachment barriers.
 bool NativeRendererEfficiencyEnabled() {
@@ -906,6 +951,11 @@ bool NativeRendererEfficiencyEnabled() {
     const char* setting = std::getenv("THEFT4_RENDERER_EFFICIENCY");
     return !setting || std::strcmp(setting, "0") != 0;
   }();
+  return enabled;
+#elif defined(THEFT4_LAB_BUILD) && defined(__linux__)
+  // The sparse texture-stage walk only applies with the indexed working-set
+  // descriptor backend ("backend=indexed-working-set" in the log).
+  static const bool enabled = NativeLinuxSwitchRequested("THEFT4_RENDERER_EFFICIENCY");
   return enabled;
 #else
   return false;
@@ -1011,6 +1061,9 @@ bool NativeFrameAssemblyEnabled() {
     return !setting || std::strcmp(setting, "0") != 0;
   }();
   return enabled;
+#elif defined(THEFT4_LAB_BUILD) && defined(__linux__)
+  static const bool enabled = NativeLinuxSwitchRequested("THEFT4_FRAME_ASSEMBLY");
+  return enabled;
 #else
   return false;
 #endif
@@ -1021,6 +1074,9 @@ bool NativeCommandStreamEnabled() {
   static const bool enabled = [] { const char* value=std::getenv("THEFT4_COMMAND_STREAM");
     return !value || std::strcmp(value,"0")!=0; }();
   return enabled;
+#elif defined(THEFT4_LAB_BUILD) && defined(__linux__)
+  static const bool enabled = NativeLinuxSwitchRequested("THEFT4_COMMAND_STREAM");
+  return enabled;
 #else
   return false;
 #endif
@@ -1030,6 +1086,10 @@ bool NativeCpuCleanupRequested() {
 #if defined(__APPLE__) && defined(THEFT4_LAB_BUILD) && TARGET_OS_IPHONE
   static const bool enabled = [] { const char* value=std::getenv("THEFT4_CPU_CLEANUP");
     return !value || std::strcmp(value,"0")!=0; }();
+  return enabled;
+#elif defined(THEFT4_LAB_BUILD) && defined(__linux__)
+  // Needs THEFT4_COMMAND_STREAM=1 (owned frame records) to have any effect.
+  static const bool enabled = NativeLinuxSwitchRequested("THEFT4_CPU_CLEANUP");
   return enabled;
 #else
   return false;
@@ -1043,6 +1103,10 @@ bool NativeMemoryRecoveryEnabled() {
     return !setting || std::strcmp(setting, "0") != 0;
   }();
   return enabled;
+#elif defined(THEFT4_LAB_BUILD) && defined(__linux__)
+  // Warnings come from gta4_native_host_memory_warnings on Linux.
+  static const bool enabled = NativeLinuxSwitchRequested("THEFT4_MEMORY_RECOVERY");
+  return enabled;
 #else
   return false;
 #endif
@@ -1055,6 +1119,9 @@ bool NativeParallelTextureConversionEnabled() {
     return !setting || std::strcmp(setting, "0") != 0;
   }();
   return enabled;
+#elif defined(THEFT4_LAB_BUILD) && defined(__linux__)
+  static const bool enabled = NativeLinuxSwitchRequested("THEFT4_PARALLEL_TEXTURE_CONVERSION");
+  return enabled;
 #else
   return false;
 #endif
@@ -1066,6 +1133,14 @@ thread_local std::array<uint64_t, rex::graphics::gta4_native::performance::kCoun
 
 namespace transition = rex::diagnostics::gta4_transition;
 namespace gpu_flight = rex::diagnostics::gpu_flight;
+
+// The flight recorder is enabled from the environment when first constructed,
+// before the renderer starts. Cache it: per-command and per-draw paths would
+// otherwise make a cross-library call even when it is off.
+bool NativeGpuFlightEnabled() {
+  static const bool enabled = gpu_flight::IsEnabled();
+  return enabled;
+}
 
 #if defined(THEFT4_LAB_BUILD) && defined(__APPLE__) && defined(__MACH__)
 // This uses the kernel's cumulative per-thread CPU accounting. Unlike the
@@ -1134,8 +1209,11 @@ constexpr uint64_t kNativeFenceWaitNanoseconds = UINT64_MAX;
 #endif
 
 bool IsNativeFlightVerboseLoggingEnabled() {
-  return rex::diagnostics::IsEnabled(rex::diagnostics::Category::kNativeTrace) ||
-         rex::diagnostics::IsEnabled(rex::diagnostics::Category::kVulkan);
+  // The diagnostics policy is installed before any worker thread starts.
+  static const bool enabled =
+      rex::diagnostics::IsEnabled(rex::diagnostics::Category::kNativeTrace) ||
+      rex::diagnostics::IsEnabled(rex::diagnostics::Category::kVulkan);
+  return enabled;
 }
 
 bool IsDeferredLightShaderFilename(std::string_view filename) {
@@ -4152,7 +4230,7 @@ void Gta4NativeGraphicsSystem::PublishDeferredNativeTrace() {
 }
 
 bool Gta4NativeGraphicsSystem::IsNativeFlightRecorderEnabled() const {
-  return gpu_flight::IsEnabled() || IsNativeFlightVerboseLoggingEnabled();
+  return NativeGpuFlightEnabled() || IsNativeFlightVerboseLoggingEnabled();
 }
 
 void Gta4NativeGraphicsSystem::StageNativeFlightResource(NativeFlightResourceKind kind,
@@ -7112,6 +7190,12 @@ void Gta4NativeGraphicsSystem::StartRenderWorker() {
               "pending-includes-active-publish=true",
               cpu_present_admission_limit_, REXCVAR_GET(gta4_native_frames_in_flight));
   constant_preparation_task_.Initialize();
+#if !defined(__APPLE__)
+  // The texture helper is otherwise created lazily on a guest producer thread
+  // and would inherit its FPCR, scheduling policy and signal mask.
+  if (NativeParallelTextureConversionEnabled())
+    texture_conversion_task_.Initialize(true, "Theft4 texture conversion", 6);
+#endif
 #ifdef THEFT4_LAB_BUILD
   current_frame_.SetOwned(NativeCommandStreamEnabled());
   command_recycler_.InitializePayloadReuse(NativeCommandStreamEnabled(),NativeDevelopmentDiagnosticsEnabled());
@@ -7131,8 +7215,13 @@ void Gta4NativeGraphicsSystem::StartRenderWorker() {
               "texture-min-cpus=6 texture-source-cap=4194304 index-frame-cap=2097152",
               NativeFrameAssemblyEnabled(), NativeParallelTextureConversionEnabled());
   REXLOG_INFO("gta4-native-preparation: enabled={} available-cpus={} helper-limit=1 "
-              "scheduler=GCD qos=user-initiated min-draws=128 max-commands=16384",
-              constant_preparation_task_.available(), constant_preparation_task_.available_cpus());
+              "scheduler={} min-draws=128 max-commands=32768",
+              constant_preparation_task_.available(), constant_preparation_task_.available_cpus(),
+#if defined(__APPLE__)
+              "GCD qos=user-initiated");
+#else
+              "std::thread");
+#endif
   if (current_frame_.capacity() < kInitialFrameCommandCapacity) {
     current_frame_.reserve(kInitialFrameCommandCapacity);
   }
@@ -7190,7 +7279,13 @@ void Gta4NativeGraphicsSystem::StartRenderWorker() {
   }
   render_worker_joinable_ = true;
 #else
-  render_worker_ = std::thread([this]() { RenderWorkerMain(); });
+  render_worker_ = std::thread([this]() {
+#if defined(__linux__)
+    // Named so linux/tools/thread_cpu.py can tell it from the helpers.
+    pthread_setname_np(pthread_self(), "Theft4 render");
+#endif
+    RenderWorkerMain();
+  });
 #endif
 }
 
@@ -9362,7 +9457,8 @@ void Gta4NativeGraphicsSystem::DestroyShaderResources() {
 }
 
 bool Gta4NativeGraphicsSystem::CreateNativeUploadBuffer(VkDeviceSize capacity,
-                                                        NativeUploadBuffer& upload_buffer) {
+                                                        NativeUploadBuffer& upload_buffer,
+                                                        bool prefer_cached) {
   auto* vulkan_provider = static_cast<ui::vulkan::VulkanProvider*>(provider_.get());
   const ui::vulkan::VulkanDevice* vulkan_device =
       vulkan_provider ? vulkan_provider->vulkan_device() : nullptr;
@@ -9387,6 +9483,19 @@ bool Gta4NativeGraphicsSystem::CreateNativeUploadBuffer(VkDeviceSize capacity,
   dfn.vkGetBufferMemoryRequirements(device, upload_buffer.buffer, &requirements);
   upload_buffer.memory_type = ui::vulkan::util::ChooseHostMemoryType(
       vulkan_device->memory_types(), requirements.memoryTypeBits, false);
+  if (prefer_cached) {
+    // Constant arenas are read back by the CPU (delta parents, masked bases);
+    // uncached write-combined reads are slow. Prefer cached and coherent; a
+    // non-coherent type is still flushed before submission.
+    const auto& types = vulkan_device->memory_types();
+    const uint32_t cached =
+        requirements.memoryTypeBits & types.host_visible & types.host_cached;
+    uint32_t chosen = UINT32_MAX;
+    if (rex::bit_scan_forward(cached & types.host_coherent, &chosen) ||
+        rex::bit_scan_forward(cached, &chosen)) {
+      upload_buffer.memory_type = chosen;
+    }
+  }
   if (upload_buffer.memory_type == UINT32_MAX) {
     DestroyNativeUploadBuffer(upload_buffer);
     return false;
@@ -9709,9 +9818,10 @@ bool Gta4NativeGraphicsSystem::GetOrCreatePersistentBuffer(
     allocation.host_data = source;
     StageNativeFlightResource(NativeFlightResourceKind::kPersistentBuffer,
                               NativeVulkanHandleIdentity(cached_entry->buffer), 0, key.generation);
-    gpu_flight::Record("native.persistent-reuse", NativeVulkanHandleIdentity(cached_entry->buffer),
-                       predicted_submission, active_texture_frame_, cached_entry->offset,
-                       cached_entry->size);
+    if (NativeGpuFlightEnabled())
+      gpu_flight::Record("native.persistent-reuse", NativeVulkanHandleIdentity(cached_entry->buffer),
+                         predicted_submission, active_texture_frame_, cached_entry->offset,
+                         cached_entry->size);
     if(development_diagnostics_)++persistent_buffer_hits_;
     AddNativeGpuProfileCounter(performance::Counter::kPersistentBufferHits);
     AddNativeGpuProfileCounter(performance::Counter::kPersistentBufferOwnerMemoHits,
@@ -9857,6 +9967,9 @@ bool Gta4NativeGraphicsSystem::EnsureFrameConstantArenaCapacity() {
   }
 
   const bool masked_enabled = NativeMaskedConstantsEnabled();
+  // The masked walk visits exactly the draws the capacity check counts; keep
+  // its count so the fast path below need not walk the frame again.
+  VkDeviceSize masked_draw_count = 0;
   if (masked_enabled) {
     for (const NativeCommand& command : current_frame_) {
       const bool is_draw = command.type == CommandType::kDrawPrimitive ||
@@ -9864,6 +9977,7 @@ bool Gta4NativeGraphicsSystem::EnsureFrameConstantArenaCapacity() {
                            command.type == CommandType::kDrawIndexedPrimitive;
       if (!is_draw || !command.shader_state || !command.shader_state->vertex_constants ||
           !command.shader_state->pixel_constants) continue;
+      ++masked_draw_count;
       NativeConstantUsage usage;
       if (command.pipeline_state && command.pipeline_state->vertex_shader_resource) {
         usage = command.pipeline_state->vertex_shader_resource->constant_usage;
@@ -9893,14 +10007,16 @@ bool Gta4NativeGraphicsSystem::EnsureFrameConstantArenaCapacity() {
     };
     constexpr VkDeviceSize worst_case_draw = aligned(kVertexConstantsSize) +
         aligned(kPixelConstantsSize) + aligned(sizeof(NativeSharedConstants));
-    VkDeviceSize draw_count = 0;
-    for (const NativeCommand& command : current_frame_) {
-      const bool is_draw = command.type == CommandType::kDrawPrimitive ||
-                           command.type == CommandType::kDrawPrimitiveUp ||
-                           command.type == CommandType::kDrawIndexedPrimitive;
-      draw_count += is_draw && command.shader_state &&
-                    command.shader_state->vertex_constants &&
-                    command.shader_state->pixel_constants;
+    VkDeviceSize draw_count = masked_draw_count;
+    if (!masked_enabled) {
+      for (const NativeCommand& command : current_frame_) {
+        const bool is_draw = command.type == CommandType::kDrawPrimitive ||
+                             command.type == CommandType::kDrawPrimitiveUp ||
+                             command.type == CommandType::kDrawIndexedPrimitive;
+        draw_count += is_draw && command.shader_state &&
+                      command.shader_state->vertex_constants &&
+                      command.shader_state->pixel_constants;
+      }
     }
     const VkDeviceSize extra = NativeGraphicsPreparationEnabled() && draw_count
         ? aligned(kVertexConstantsSize) : 0;
@@ -10013,7 +10129,8 @@ bool Gta4NativeGraphicsSystem::EnsureFrameConstantArenaCapacity() {
       return false;
     }
     NativeUploadBuffer replacement{};
-    if (!CreateNativeUploadBuffer(desired_capacity, replacement)) {
+    if (!CreateNativeUploadBuffer(desired_capacity, replacement,
+                                  REXCVAR_GET(gta4_native_cached_constant_arena))) {
       return false;
     }
     replacement.write_offset = 0;
@@ -12976,7 +13093,8 @@ memory::Snapshot Gta4NativeGraphicsSystem::CollectNativeMemorySnapshot(uint32_t 
   set_usage(memory::Category::kGpuNullResources, null_bytes, null_bytes, null_count);
 
   const NativeTextureHeapBudgets budgets = QueryNativeTextureHeapBudgets();
-  if (budgets.available) {
+  // Driver-reported heaps only; a host-derived texture budget is not heap usage.
+  if (budgets.available && !budgets.host_fallback) {
     for (uint32_t heap = 0; heap < budgets.heap_count; ++heap) {
       snapshot.vulkan_heap_usage_bytes += budgets.usage[heap];
       snapshot.vulkan_heap_budget_bytes += budgets.budget[heap];
@@ -17786,29 +17904,47 @@ bool Gta4NativeGraphicsSystem::EnsureFrameUploadCapacity(
     required_capacity = aligned_offset + size;
   };
 
+  const bool lean_planning = REXCVAR_GET(gta4_native_lean_upload_planning);
+  const uint64_t plan_epoch = ++upload_plan_epoch_;
   std::unordered_set<uint64_t> pending_texture_generations;
-  auto add_texture = [&](const std::shared_ptr<const NativeTextureResource>& texture) {
-    if (!texture || texture->gpu_produced || texture->payload.empty() ||
+  // Raw pointers: frame records hold their owners, and converting a frame
+  // resource ref to shared_ptr costs two atomics per binding.
+  auto add_texture = [&](const NativeTextureResource* texture) {
+    if (!texture) return;
+    // Nothing below changes during planning, so later bindings of the same
+    // resource cannot add anything.
+    if (lean_planning) {
+      if (texture->upload_plan_epoch == plan_epoch) return;
+      texture->upload_plan_epoch = plan_epoch;
+    }
+    if (texture->gpu_produced || texture->payload.empty() ||
         native_texture_images_.contains(texture->generation) ||
         !pending_texture_generations.insert(texture->generation).second) {
       return;
     }
     add_allocation(VkDeviceSize(texture->payload.size()), 16);
   };
-  add_texture(present_source);
+  add_texture(present_source.get());
 
   using VertexUploadKey =
       std::tuple<const NativeBufferResource*, uint64_t, uint64_t, uint32_t, uint32_t, uint32_t>;
   std::set<VertexUploadKey> pending_vertex_uploads;
   std::set<std::pair<const NativeBufferResource*, bool>> pending_index_uploads;
   const bool persistent_buffers_enabled = REXCVAR_GET(gta4_native_persistent_buffers);
-  const bool persistent_direct_upload =
-      persistent_buffers_enabled && vulkan_device->properties().driverID == VK_DRIVER_ID_MOLTENVK;
+  // Persistent blocks prefer a device-local, host-visible type and are then
+  // filled by memcpy, never through this staging arena (MoltenVK always; any
+  // unified-memory driver such as Honeykrisp too). A rare unplanned staging
+  // fallback grows an overflow block in AllocateUpload.
+  const auto& upload_memory_types = vulkan_device->memory_types();
+  const bool unified_persistent_blocks = lean_planning &&
+      (upload_memory_types.device_local & upload_memory_types.host_visible) != 0;
+  const bool persistent_direct_upload = persistent_buffers_enabled &&
+      (vulkan_device->properties().driverID == VK_DRIVER_ID_MOLTENVK || unified_persistent_blocks);
   const bool sparse_texture_walks = REXCVAR_GET(gta4_native_sparse_texture_walks);
   uint32_t draw_count = 0;
   for (const NativeCommand& command : current_frame_) {
-    add_texture(command.resolve_destination);
-    add_texture(command.depth_handoff_source);
+    add_texture(command.resolve_destination.get());
+    add_texture(command.depth_handoff_source.get());
     const bool is_draw = command.type == CommandType::kDrawPrimitive ||
                          command.type == CommandType::kDrawPrimitiveUp ||
                          command.type == CommandType::kDrawIndexedPrimitive;
@@ -17816,11 +17952,11 @@ bool Gta4NativeGraphicsSystem::EnsureFrameUploadCapacity(
       uint32_t stages = command.used_texture_mask;
       while (stages) {
         const uint32_t stage = std::countr_zero(stages);
-        add_texture(command.textures[stage]);
+        add_texture(command.textures[stage].get());
         stages &= stages - 1;
       }
     } else {
-      for (const auto& texture : command.textures) add_texture(texture);
+      for (const auto& texture : command.textures) add_texture(texture.get());
     }
     if (!is_draw) {
       continue;
@@ -18041,11 +18177,12 @@ Gta4NativeGraphicsSystem::QueryNativeTextureHeapBudgets() const {
       vulkan_device ? vulkan_device->vulkan_instance() : nullptr;
   if (!vulkan_device || !vulkan_instance || !vulkan_device->extensions().ext_EXT_memory_budget ||
       !vulkan_instance->extensions().ext_1_1_KHR_get_physical_device_properties2) {
-    return result;
+    return vulkan_device && REXCVAR_GET(gta4_native_host_memory_budget)
+        ? QueryHostTextureHeapBudgets() : result;
   }
   const auto& ifn = vulkan_instance->functions();
   if (!ifn.vkGetPhysicalDeviceMemoryProperties2) {
-    return result;
+    return REXCVAR_GET(gta4_native_host_memory_budget) ? QueryHostTextureHeapBudgets() : result;
   }
   VkPhysicalDeviceMemoryBudgetPropertiesEXT budget_properties{};
   budget_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
@@ -18061,6 +18198,63 @@ Gta4NativeGraphicsSystem::QueryNativeTextureHeapBudgets() const {
     result.budget[heap] = budget_properties.heapBudget[heap];
   }
   return result;
+}
+
+// Honeykrisp exposes one unified heap and no VK_EXT_memory_budget. Treat the
+// renderer's own texture bytes as usage and grant what the host can still give
+// above the reserve, so the 90%/85% pressure thresholds track host headroom.
+Gta4NativeGraphicsSystem::NativeTextureHeapBudgets
+Gta4NativeGraphicsSystem::QueryHostTextureHeapBudgets() const {
+  NativeTextureHeapBudgets result{};
+  const auto host = SampleNativeHostMemory();
+  auto* vulkan_provider = static_cast<ui::vulkan::VulkanProvider*>(provider_.get());
+  const ui::vulkan::VulkanDevice* vulkan_device =
+      vulkan_provider ? vulkan_provider->vulkan_device() : nullptr;
+  if (!host.mem_available_valid || !vulkan_device) return result;
+  VkPhysicalDeviceMemoryProperties properties{};
+  vulkan_device->vulkan_instance()->functions().vkGetPhysicalDeviceMemoryProperties(
+      vulkan_device->physical_device(), &properties);
+  auto usage = accounted_texture_bytes_;
+  for (const auto& pooled : texture_allocation_pool_.entries())
+    if (pooled.allocation.memory_heap < usage.size()) usage[pooled.allocation.memory_heap] += pooled.bytes;
+  const uint64_t reserve = uint64_t(REXCVAR_GET(gta4_native_host_memory_reserve_mb)) * 1048576ull;
+  result.available = true;
+  result.host_fallback = true;
+  result.heap_count = std::min(properties.memoryHeapCount, uint32_t(VK_MAX_MEMORY_HEAPS));
+  for (uint32_t heap = 0; heap < result.heap_count; ++heap) {
+    result.usage[heap] = usage[heap];
+    result.budget[heap] = NativeHostTextureBudget(properties.memoryHeaps[heap].size, usage[heap],
+                                                  host.mem_available_bytes, reserve, 75);
+  }
+  return result;
+}
+
+void Gta4NativeGraphicsSystem::PollHostMemoryPressure(uint32_t frame) {
+  if (!REXCVAR_GET(gta4_native_host_memory_warnings) ||
+      !host_memory_poll_schedule_.ShouldRun(frame, 30)) return;
+  const auto host = SampleNativeHostMemory();
+  const uint64_t reserve = uint64_t(REXCVAR_GET(gta4_native_host_memory_reserve_mb)) * 1048576ull;
+  const bool low_available = host.mem_available_valid && host.mem_available_bytes < reserve;
+  const bool stalled = host.psi_valid &&
+      host.psi_some_avg10 >= REXCVAR_GET(gta4_native_host_memory_psi_percent);
+  if (!low_available && !stalled) {
+    host_memory_warning_interval_ = 600;
+    return;
+  }
+  // Recovery runs for 120 title presents and PSI avg10 decays over ten
+  // seconds, so wait 600 frames between requests. If pressure persists
+  // anyway, trimming the renderer is not relieving it: back off (doubling to
+  // 9600 frames) until a poll sees the host recover.
+  if (host_memory_warning_sent_ && frame >= host_memory_warning_frame_ &&
+      frame - host_memory_warning_frame_ < host_memory_warning_interval_) return;
+  if (host_memory_warning_sent_) host_memory_warning_interval_ =
+      std::min<uint32_t>(host_memory_warning_interval_ * 2, 9600);
+  host_memory_warning_sent_ = true;
+  host_memory_warning_frame_ = frame;
+  light::memory_warnings.fetch_add(1, std::memory_order_relaxed);
+  REXLOG_INFO("gta4-native-memory: host pressure frame={} mem-available-mib={} psi-some-avg10={:.2f} "
+              "recovery={} next-interval={}", frame, host.mem_available_bytes / 1048576,
+              host.psi_some_avg10, NativeMemoryRecoveryEnabled(), host_memory_warning_interval_);
 }
 
 void Gta4NativeGraphicsSystem::DestroyNativeTextureImage(NativeTextureImage& image) {
@@ -19474,9 +19668,11 @@ bool Gta4NativeGraphicsSystem::PrepareFrameTextures(VkCommandBuffer command_buff
   null_descriptor_key.images_3d.fill(null_texture_3d_.view);
   null_descriptor_key.images_cube.fill(null_texture_cube_.view);
   null_descriptor_key.samplers.fill(null_sampler_);
+  // Read the string cvar once per frame, not per draw.
+  const bool room_light_probe = REXCVAR_GET(gta4_native_light_color_delta_probe) == "room";
   const bool reuse_prepared_bindings = !trace_reflections && !FireTraceConfig().enabled &&
       !EmissionTraceConfig().pipeline_full_readback && !PhoneTraceConfig().enabled &&
-      REXCVAR_GET(gta4_native_light_color_delta_probe) != "room" &&
+      !room_light_probe &&
       !rex::diagnostics::IsEnabled(rex::diagnostics::Category::kNativeTranslucency);
 
   const profile::CpuPhaseScope profile_phase(profile::CpuPhase::kTextures);
@@ -19654,7 +19850,7 @@ bool Gta4NativeGraphicsSystem::PrepareFrameTextures(VkCommandBuffer command_buff
     const bool capture_fire_bindings = FireTraceConfig().enabled &&
         (command.fire_trace || submitted_frame % FireTraceConfig().interval == 0);
     if (capture_fire_bindings || capture_bulb_bindings || TvCommandRole(command) || (PhoneTraceConfig().lineage && command.phone_trace) ||
-        (REXCVAR_GET(gta4_native_light_color_delta_probe) == "room" && !room_light_probe_stop_requested_ &&
+        (room_light_probe && !room_light_probe_stop_requested_ &&
          command.pipeline_state && command.pipeline_state->pixel_shader_resource &&
          IsDeferredLightShaderFilename(command.pipeline_state->pixel_shader_resource->filename))) {
       command.room_light_input_bindings =
@@ -20407,6 +20603,7 @@ void Gta4NativeGraphicsSystem::EvictNativeTextureImages(uint32_t submitted_frame
   // cache permanently under pressure and recreate textures continuously.
   if (configured_limit_bytes) {
     budgets.available = true;
+    budgets.host_fallback = false;
     budgets.heap_count = native_texture_heap_count;
     budgets.usage = native_texture_usage;
     for (uint32_t heap = 0; heap < budgets.heap_count; ++heap) {
@@ -20434,6 +20631,13 @@ void Gta4NativeGraphicsSystem::EvictNativeTextureImages(uint32_t submitted_frame
     }
     texture_budget_pressure_active_ = pressure_after_poll;
   }
+  // Driver budgets only reorder aged candidates under pressure. A host-derived
+  // budget means the system itself is short of memory, so it also shortens the
+  // age at which unreferenced textures may be retired.
+  const uint32_t grace_frames = ios_pressure ? 60
+      : budgets.host_fallback && texture_budget_pressure_active_
+          ? REXCVAR_GET(gta4_native_host_memory_grace_frames)
+          : kNativeTextureCacheRetentionFrames;
 
   std::vector<Candidate> candidates;
   auto consider = [&](uint64_t generation, const NativeTextureImage* image) {
@@ -20441,7 +20645,7 @@ void Gta4NativeGraphicsSystem::EvictNativeTextureImages(uint32_t submitted_frame
         !CanDiscardNativeTextureImageContents(image->source->gpu_produced, !image->source->payload.empty()) ||
         protected_texture_generations_.contains(generation)) return;
     if (!allocation_recovery && !ShouldEvictNativeTextureCandidate(false, true, submitted_frame,
-          image->last_used_frame, ios_pressure ? 60 : kNativeTextureCacheRetentionFrames)) return;
+          image->last_used_frame, grace_frames)) return;
     if (ios_pressure && !allocation_recovery &&
         image->last_used_submission > completed_command_buffer_submission_) return;
     candidates.push_back({{image->last_use_serial, generation}, image->memory_heap, image->allocation_size});
@@ -20506,8 +20710,7 @@ void Gta4NativeGraphicsSystem::EvictNativeTextureImages(uint32_t submitted_frame
                                        budgets.budget[candidate.memory_heap]));
       if (!allocation_recovery &&
           !ShouldEvictNativeTextureCandidate(false, budget_pressure, submitted_frame,
-                                             image->second->last_used_frame,
-                                             ios_pressure ? 60 : kNativeTextureCacheRetentionFrames)) {
+                                             image->second->last_used_frame, grace_frames)) {
         continue;
       }
 
@@ -21565,6 +21768,9 @@ bool NativePrewarmTargetReuseEnabled() {
     const char* setting = std::getenv("THEFT4_PREWARM_TARGET_REUSE");
     return !setting || std::strcmp(setting, "0") != 0;
   }();
+  return enabled;
+#elif defined(THEFT4_LAB_BUILD) && defined(__linux__)
+  static const bool enabled = NativeLinuxSwitchRequested("THEFT4_PREWARM_TARGET_REUSE");
   return enabled;
 #else
   return false;
@@ -23116,8 +23322,9 @@ void Gta4NativeGraphicsSystem::BeginParallelGuestConstants(bool trace_stages) {
   prepared_guest_constants_.clear();
   prepared_index_conversions_.clear();
   preparation_index_bytes_ = preparation_index_count_ = 0;
+  // Busy streets reach 12-16K frame commands; 32K keeps them on the helper.
   if (!constant_preparation_task_.available() || trace_stages ||
-      current_frame_.size() < 128 || current_frame_.size() > 16384 ||
+      current_frame_.size() < 128 || current_frame_.size() > 32768 ||
       g_native_memory_profile_deep_active.load(std::memory_order_acquire) ||
       REXCVAR_GET(gta4_validate_native_hot_caches) || FireTraceConfig().enabled ||
       EmissionTraceConfig().pipeline_full_readback || PhoneTraceConfig().enabled ||
@@ -23145,7 +23352,7 @@ void Gta4NativeGraphicsSystem::BeginParallelGuestConstants(bool trace_stages) {
 void Gta4NativeGraphicsSystem::RunParallelGuestConstants() {
   const uint64_t begin = light::Tick();
   preparation_queue_delay_ticks_ = begin - preparation_queued_tick_;
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(__linux__)
   timespec cpu_begin{}, cpu_end{};
   const bool has_cpu = clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_begin) == 0;
 #endif
@@ -23192,7 +23399,7 @@ void Gta4NativeGraphicsSystem::RunParallelGuestConstants() {
       }
     }
   }
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(__linux__)
   if (has_cpu && clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_end) == 0) {
     const int64_t elapsed = (int64_t(cpu_end.tv_sec) - cpu_begin.tv_sec) * 1000000000ll +
         int64_t(cpu_end.tv_nsec) - cpu_begin.tv_nsec;
@@ -23467,7 +23674,7 @@ bool Gta4NativeGraphicsSystem::BindCommonDrawState(
       command.pipeline_state && command.pipeline_state->vertex_shader_resource
           ? command.pipeline_state->vertex_shader_resource->hash
           : 0;
-  if (gpu_flight::IsEnabled()) {
+  if (NativeGpuFlightEnabled()) {
     const uint64_t submission = submission_tracker_ ? submission_tracker_->GetCurrentSubmission() : 0;
     gpu_flight::Record("native.draw-pipeline", NativeVulkanHandleIdentity(pipeline), submission,
                        diagnostic_submitted_frame_, diagnostic_command_index_,
@@ -24690,7 +24897,12 @@ bool Gta4NativeGraphicsSystem::RecordIndexedPrimitive(VkCommandBuffer command_bu
     host_index_buffer = quad_list_indices.buffer;
     host_index_offset = quad_list_indices.offset;
   }
-  if (guest_restart_enabled) {
+  // 16-bit strips whose guest restart index is already 0xFFFF need no rewrite:
+  // it would copy every index unchanged into staging. Quad lists are never
+  // strips, so the selected bytes are still the uploaded buffer here.
+  const bool identity_restart = !index32 && draw.primitive_restart_index == UINT16_MAX &&
+      REXCVAR_GET(gta4_native_skip_identity_restart_rewrite);
+  if (guest_restart_enabled && !identity_restart) {
     const VkDeviceSize restart_size = VkDeviceSize(host_index_count) * element_size;
     if (!AllocateUpload(restart_size, size_t(element_size), primitive_restart_indices,
                         NativeUploadKind::kIndex)) {
@@ -28806,6 +29018,8 @@ bool Gta4NativeGraphicsSystem::RecordPresent(
         shader_source_image, shader_source_view, *shader_source_layout,
         {shader_source_width, shader_source_height}, quality, smaa_output, timing, nullptr, smaa_linear_view);
     capture_hardware_path();
+    // The SMAA passes bind their own pipelines and dynamic state.
+    native_draw_state_cache_.Reset();
     if (smaa_applied) {
       shader_source_image = smaa_output.image;
       shader_source_view = smaa_output.view;
@@ -31369,9 +31583,10 @@ bool Gta4NativeGraphicsSystem::RecordNativeFrame(
     }
     diagnostic_submitted_frame_ = submitted_frame;
     diagnostic_command_index_ = command_index;
-    gpu_flight::Record("native.command", NativeVulkanHandleIdentity(command_buffer),
-                       submission_tracker_ ? submission_tracker_->GetCurrentSubmission() : 0,
-                       submitted_frame, command_index, uint64_t(command.type));
+    if (NativeGpuFlightEnabled())
+      gpu_flight::Record("native.command", NativeVulkanHandleIdentity(command_buffer),
+                         submission_tracker_ ? submission_tracker_->GetCurrentSubmission() : 0,
+                         submitted_frame, command_index, uint64_t(command.type));
     diagnostic_render_phase_ = command.render_phase;
     diagnostic_render_phase_object_ = command.render_phase_object;
     fire_event_active_ = fire_frame_ && (command.fire_trace || command.type == CommandType::kResolve ||
@@ -37213,6 +37428,7 @@ bool Gta4NativeGraphicsSystem::ClearGuestOutput(
             tv_lifecycle_trace_->run, submitted_frame, present.device != 0,
             active_texture_frame_, resource_frame));
         active_texture_frame_ = resource_frame;
+        PollHostMemoryPressure(resource_frame);
         BeginMemoryPressureRecovery(resource_frame, present.device != 0);
         ReleasePendingSurfaceImages();
         finish_housekeeping_stage(performance::CpuRange::kHousekeepingSurfaceRelease);
