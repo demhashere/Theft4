@@ -7,6 +7,8 @@
 #include <TargetConditionals.h>
 #include <dispatch/dispatch.h>
 #include <sys/sysctl.h>
+#else
+#include "native_helper_thread.h"
 #endif
 
 namespace rex::graphics::gta4_native {
@@ -14,6 +16,7 @@ namespace rex::graphics::gta4_native {
 // Each owner admits at most one helper. GCD owns the threads and chooses cores
 // on every SoC; callers impose stage-specific work and CPU-capacity limits.
 // No model identifiers, affinity masks, spinning, or per-draw dispatches.
+// Elsewhere one persistent std::thread per owner replaces the serial queue.
 class NativePreparationTask {
  public:
   using Function = void (*)(void*);
@@ -36,6 +39,11 @@ class NativePreparationTask {
     auto attributes = dispatch_queue_attr_make_with_qos_class(
         DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0);
     queue_ = dispatch_queue_create(name, attributes);
+#else
+    // Online CPUs (all cores on Asahi: 4 performance + 4 efficiency on M2).
+    available_cpus_ = NativeHelperThread::OnlineCpus();
+    if (available_cpus_ < minimum_cpus || !requested) return;
+    helper_.Launch(name);
 #endif
   }
   ~NativePreparationTask() {
@@ -52,6 +60,10 @@ class NativePreparationTask {
     // Called when the render worker starts after the launcher applies env.
     const char* value = std::getenv("THEFT4_PARALLEL_PREPARATION");
     return !value || std::strcmp(value, "0") != 0;
+#elif defined(__linux__)
+    // Same switch as iOS, but opt-in until measured on Asahi.
+    const char* value = std::getenv("THEFT4_PARALLEL_PREPARATION");
+    return value && std::strcmp(value, "1") == 0;
 #else
     return false;
 #endif
@@ -61,7 +73,7 @@ class NativePreparationTask {
 #if defined(__APPLE__)
     return group_ && queue_;
 #else
-    return false;
+    return helper_.launched();
 #endif
   }
   bool Start(void* context, Function function) {
@@ -76,7 +88,10 @@ class NativePreparationTask {
     });
     return true;
 #else
-    return false;
+    if (!available() || pending_) return false;
+    if (!helper_.Start(context, function)) return false;
+    pending_ = true;
+    return true;
 #endif
   }
   bool pending() const { return pending_; }
@@ -86,17 +101,24 @@ class NativePreparationTask {
       dispatch_group_wait(group_, DISPATCH_TIME_FOREVER);
       pending_ = false;
     }
+#else
+    if (pending_) {
+      helper_.Join();
+      pending_ = false;
+    }
 #endif
   }
  private:
   uint32_t available_cpus_ = 0;
   bool pending_ = false;
   bool initialized_ = false;
+#if defined(__APPLE__)
   void* context_ = nullptr;
   Function function_ = nullptr;
-#if defined(__APPLE__)
   dispatch_group_t group_ = nullptr;
   dispatch_queue_t queue_ = nullptr;
+#else
+  NativeHelperThread helper_;
 #endif
 };
 }  // namespace rex::graphics::gta4_native

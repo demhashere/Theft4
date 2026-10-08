@@ -7,6 +7,8 @@
 #include <vector>
 #if defined(__APPLE__)
 #include <dispatch/dispatch.h>
+#else
+#include "native_helper_thread.h"
 #endif
 
 namespace rex::graphics::gta4_native {
@@ -30,28 +32,36 @@ class NativeDeferredCleanup {
     group_ = dispatch_group_create();
     auto attributes = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,QOS_CLASS_UTILITY,0);
     queue_ = dispatch_queue_create("Theft4 completed CPU records",attributes);
+#else
+    // Below the render worker, like GCD's utility QoS.
+    if (!requested || available_cpus < 4 || helper_.launched()) return;
+    helper_.Launch("Theft4 cleanup", 5);
 #endif
   }
   bool available() const {
 #if defined(__APPLE__)
     return group_ && queue_;
 #else
-    return false;
+    return helper_.launched();
 #endif
   }
   void Poll() {
 #if defined(__APPLE__)
     if (!pending_ || dispatch_group_wait(group_,DISPATCH_TIME_NOW) != 0) return;
+#else
+    if (!pending_ || !helper_.TryJoin()) return;
+#endif
     // The group wait establishes callback completion and publication; result
     // fields are never read while the utility callback can still write them.
     pending_ = false;
     if(diagnostics_) {++completed_; commands_ += job_commands_; cpu_ns_ += job_cpu_ns_; wall_ns_ += job_wall_ns_;}
     retained_metadata_bytes_ = 0;
-#endif
   }
   void Wait() {
 #if defined(__APPLE__)
     if (pending_) { dispatch_group_wait(group_,DISPATCH_TIME_FOREVER); Poll(); }
+#else
+    if (pending_) { helper_.Join(); Poll(); }
 #endif
   }
   bool TryStart(std::vector<Owner>& records, size_t metadata_bytes, Recycler& recycler) {
@@ -61,12 +71,13 @@ class NativeDeferredCleanup {
     // Bounds direct command metadata and owner count. Immutable resources can
     // be shared with caches/current work: this is not a total resource-byte cap.
     if (records.size() > 8192 || metadata_bytes > 67108864) { if(diagnostics_)++budget_fallbacks_; return false; }
-#if defined(__APPLE__)
     records_.swap(records);
     recycler_ = &recycler;if(diagnostics_)job_commands_ = records_.size();
     retained_metadata_bytes_ = metadata_bytes;
     if(diagnostics_)high_water_metadata_bytes_ = std::max(high_water_metadata_bytes_,uint64_t(metadata_bytes));
-    if(diagnostics_)++started_; pending_ = true;
+    if(diagnostics_)++started_;
+    pending_ = true;
+#if defined(__APPLE__)
     dispatch_group_async_f(group_,queue_,this,[](void* raw) {
       auto& self = *static_cast<NativeDeferredCleanup*>(raw);
       if(!self.diagnostics_) {self.recycler_->RecycleExternalBatch(self.records_);return;}
@@ -84,6 +95,11 @@ class NativeDeferredCleanup {
     });
     return true;
 #else
+    if (helper_.Start(this, &RunBatch)) return true;
+    // Launch failed after Initialize: hand the records back unchanged.
+    records.swap(records_);
+    pending_ = false; retained_metadata_bytes_ = 0;
+    if(diagnostics_) --started_;
     return false;
 #endif
   }
@@ -107,6 +123,23 @@ class NativeDeferredCleanup {
 #if defined(__APPLE__)
   dispatch_group_t group_ = nullptr;
   dispatch_queue_t queue_ = nullptr;
+#else
+  static void RunBatch(void* raw) {
+    auto& self = *static_cast<NativeDeferredCleanup*>(raw);
+    if(!self.diagnostics_) {self.recycler_->RecycleExternalBatch(self.records_);return;}
+    const auto wall_begin = std::chrono::steady_clock::now();
+    timespec begin{},end{};
+    const bool valid_cpu = clock_gettime(CLOCK_THREAD_CPUTIME_ID,&begin)==0;
+    self.recycler_->RecycleExternalBatch(self.records_);
+    self.job_cpu_ns_ = 0;
+    if (valid_cpu && clock_gettime(CLOCK_THREAD_CPUTIME_ID,&end)==0) {
+      const int64_t duration = (int64_t(end.tv_sec)-begin.tv_sec)*1000000000ll+end.tv_nsec-begin.tv_nsec;
+      if (duration>0) self.job_cpu_ns_ = uint64_t(duration);
+    }
+    self.job_wall_ns_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now()-wall_begin).count();
+  }
+  NativeHelperThread helper_;
 #endif
 };
 } // namespace rex::graphics::gta4_native
