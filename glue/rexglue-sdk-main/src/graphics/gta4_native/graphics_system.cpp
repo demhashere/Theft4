@@ -18,6 +18,8 @@
 #if defined(__APPLE__)
 #include <unistd.h>
 #include <cerrno>
+#elif defined(__linux__)
+#include <pthread.h>
 #endif
 #include "native_cpu_profile_scope.h"
 #include "native_pass_stats.h"
@@ -898,6 +900,13 @@ extern "C" __attribute__((visibility("default"))) int rex_gta4_native_memory_pro
 
 namespace {
 
+// Linux reads the same THEFT4_* switches as the iOS launcher, but each one is
+// opt-in ("1") until it has been measured on Asahi; iOS defaults them on.
+[[maybe_unused]] bool NativeLinuxSwitchRequested(const char* name) {
+  const char* value = std::getenv(name);
+  return value && std::strcmp(value, "1") == 0;
+}
+
 // Latched before the first gameplay command; a fresh launch applies changes.
 // Shared by the draw encoder, descriptor preparation and attachment barriers.
 bool NativeRendererEfficiencyEnabled() {
@@ -1021,6 +1030,9 @@ bool NativeCommandStreamEnabled() {
   static const bool enabled = [] { const char* value=std::getenv("THEFT4_COMMAND_STREAM");
     return !value || std::strcmp(value,"0")!=0; }();
   return enabled;
+#elif defined(THEFT4_LAB_BUILD) && defined(__linux__)
+  static const bool enabled = NativeLinuxSwitchRequested("THEFT4_COMMAND_STREAM");
+  return enabled;
 #else
   return false;
 #endif
@@ -1030,6 +1042,10 @@ bool NativeCpuCleanupRequested() {
 #if defined(__APPLE__) && defined(THEFT4_LAB_BUILD) && TARGET_OS_IPHONE
   static const bool enabled = [] { const char* value=std::getenv("THEFT4_CPU_CLEANUP");
     return !value || std::strcmp(value,"0")!=0; }();
+  return enabled;
+#elif defined(THEFT4_LAB_BUILD) && defined(__linux__)
+  // Needs THEFT4_COMMAND_STREAM=1 (owned frame records) to have any effect.
+  static const bool enabled = NativeLinuxSwitchRequested("THEFT4_CPU_CLEANUP");
   return enabled;
 #else
   return false;
@@ -1043,6 +1059,9 @@ bool NativeMemoryRecoveryEnabled() {
     return !setting || std::strcmp(setting, "0") != 0;
   }();
   return enabled;
+#elif defined(THEFT4_LAB_BUILD) && defined(__linux__)
+  static const bool enabled = NativeLinuxSwitchRequested("THEFT4_FRAME_ASSEMBLY");
+  return enabled;
 #else
   return false;
 #endif
@@ -1054,6 +1073,9 @@ bool NativeParallelTextureConversionEnabled() {
     const char* setting = std::getenv("THEFT4_PARALLEL_TEXTURE_CONVERSION");
     return !setting || std::strcmp(setting, "0") != 0;
   }();
+  return enabled;
+#elif defined(THEFT4_LAB_BUILD) && defined(__linux__)
+  static const bool enabled = NativeLinuxSwitchRequested("THEFT4_PARALLEL_TEXTURE_CONVERSION");
   return enabled;
 #else
   return false;
@@ -7112,6 +7134,12 @@ void Gta4NativeGraphicsSystem::StartRenderWorker() {
               "pending-includes-active-publish=true",
               cpu_present_admission_limit_, REXCVAR_GET(gta4_native_frames_in_flight));
   constant_preparation_task_.Initialize();
+#if !defined(__APPLE__)
+  // The texture helper is otherwise created lazily on a guest producer thread
+  // and would inherit its FPCR, scheduling policy and signal mask.
+  if (NativeParallelTextureConversionEnabled())
+    texture_conversion_task_.Initialize(true, "Theft4 texture conversion", 6);
+#endif
 #ifdef THEFT4_LAB_BUILD
   current_frame_.SetOwned(NativeCommandStreamEnabled());
   command_recycler_.InitializePayloadReuse(NativeCommandStreamEnabled(),NativeDevelopmentDiagnosticsEnabled());
@@ -7131,8 +7159,13 @@ void Gta4NativeGraphicsSystem::StartRenderWorker() {
               "texture-min-cpus=6 texture-source-cap=4194304 index-frame-cap=2097152",
               NativeFrameAssemblyEnabled(), NativeParallelTextureConversionEnabled());
   REXLOG_INFO("gta4-native-preparation: enabled={} available-cpus={} helper-limit=1 "
-              "scheduler=GCD qos=user-initiated min-draws=128 max-commands=16384",
-              constant_preparation_task_.available(), constant_preparation_task_.available_cpus());
+              "scheduler={} min-draws=128 max-commands=32768",
+              constant_preparation_task_.available(), constant_preparation_task_.available_cpus(),
+#if defined(__APPLE__)
+              "GCD qos=user-initiated");
+#else
+              "std::thread");
+#endif
   if (current_frame_.capacity() < kInitialFrameCommandCapacity) {
     current_frame_.reserve(kInitialFrameCommandCapacity);
   }
@@ -7190,7 +7223,13 @@ void Gta4NativeGraphicsSystem::StartRenderWorker() {
   }
   render_worker_joinable_ = true;
 #else
-  render_worker_ = std::thread([this]() { RenderWorkerMain(); });
+  render_worker_ = std::thread([this]() {
+#if defined(__linux__)
+    // Named so linux/tools/thread_cpu.py can tell it from the helpers.
+    pthread_setname_np(pthread_self(), "Theft4 render");
+#endif
+    RenderWorkerMain();
+  });
 #endif
 }
 
@@ -21566,6 +21605,9 @@ bool NativePrewarmTargetReuseEnabled() {
     return !setting || std::strcmp(setting, "0") != 0;
   }();
   return enabled;
+#elif defined(THEFT4_LAB_BUILD) && defined(__linux__)
+  static const bool enabled = NativeLinuxSwitchRequested("THEFT4_PREWARM_TARGET_REUSE");
+  return enabled;
 #else
   return false;
 #endif
@@ -23116,8 +23158,9 @@ void Gta4NativeGraphicsSystem::BeginParallelGuestConstants(bool trace_stages) {
   prepared_guest_constants_.clear();
   prepared_index_conversions_.clear();
   preparation_index_bytes_ = preparation_index_count_ = 0;
+  // Busy streets reach 12-16K frame commands; 32K keeps them on the helper.
   if (!constant_preparation_task_.available() || trace_stages ||
-      current_frame_.size() < 128 || current_frame_.size() > 16384 ||
+      current_frame_.size() < 128 || current_frame_.size() > 32768 ||
       g_native_memory_profile_deep_active.load(std::memory_order_acquire) ||
       REXCVAR_GET(gta4_validate_native_hot_caches) || FireTraceConfig().enabled ||
       EmissionTraceConfig().pipeline_full_readback || PhoneTraceConfig().enabled ||
@@ -23145,7 +23188,7 @@ void Gta4NativeGraphicsSystem::BeginParallelGuestConstants(bool trace_stages) {
 void Gta4NativeGraphicsSystem::RunParallelGuestConstants() {
   const uint64_t begin = light::Tick();
   preparation_queue_delay_ticks_ = begin - preparation_queued_tick_;
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(__linux__)
   timespec cpu_begin{}, cpu_end{};
   const bool has_cpu = clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_begin) == 0;
 #endif
@@ -23192,7 +23235,7 @@ void Gta4NativeGraphicsSystem::RunParallelGuestConstants() {
       }
     }
   }
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(__linux__)
   if (has_cpu && clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_end) == 0) {
     const int64_t elapsed = (int64_t(cpu_end.tv_sec) - cpu_begin.tv_sec) * 1000000000ll +
         int64_t(cpu_end.tv_nsec) - cpu_begin.tv_nsec;
