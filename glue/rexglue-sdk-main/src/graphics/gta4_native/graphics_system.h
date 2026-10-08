@@ -946,6 +946,8 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
 
   struct NativeTextureHeapBudgets {
     bool available = false;
+    // Derived from host MemAvailable (gta4_native_host_memory_budget), not the driver.
+    bool host_fallback = false;
     uint32_t heap_count = 0;
     std::array<VkDeviceSize, VK_MAX_MEMORY_HEAPS> usage{};
     std::array<VkDeviceSize, VK_MAX_MEMORY_HEAPS> budget{};
@@ -2410,6 +2412,12 @@ class Gta4NativeGraphicsSystem final : public system::IGraphicsSystem {
   uint64_t texture_allocation_reuses_=0;
   void TrimTextureAllocationPool(bool all);
   void BeginMemoryPressureRecovery(uint32_t frame, bool title_present);
+  // Linux PSI/MemAvailable source for the memory warnings above.
+  void PollHostMemoryPressure(uint32_t frame);
+  NativeTextureHeapBudgets QueryHostTextureHeapBudgets() const;
+  NativePeriodicWorkSchedule host_memory_poll_schedule_{0};
+  uint32_t host_memory_warning_frame_ = 0;
+  bool host_memory_warning_sent_ = false;
   uint64_t command_pool_reset_count_ = 0;
   VkPipelineLayout pipeline_layout_ = VK_NULL_HANDLE;
   VkPipelineCache native_pipeline_cache_ = VK_NULL_HANDLE;

@@ -22,6 +22,7 @@
 #include <pthread.h>
 #endif
 #include "native_cpu_profile_scope.h"
+#include "native_host_memory.h"
 #include "native_pass_stats.h"
 #include "native_profile_shader_category.h"
 #include "modern_shader_options.h"
@@ -422,6 +423,27 @@ REXCVAR_DEFINE_UINT32(
 REXCVAR_DEFINE_UINT32(
     gta4_native_texture_memory_limit_mb, 0, "GTA IV/Graphics/Native Renderer",
     "Optional native texture heap budget cap in MiB (0 uses the Vulkan driver budget)");
+REXCVAR_DEFINE_BOOL(
+    gta4_native_host_memory_budget, false, "GTA IV/Graphics/Native Renderer",
+    "Without VK_EXT_memory_budget (Honeykrisp), derive the texture budget from host "
+    "MemAvailable; under that pressure, textures unused for "
+    "gta4_native_host_memory_grace_frames are retired instead of after 600 frames");
+REXCVAR_DEFINE_UINT32(
+    gta4_native_host_memory_reserve_mb, 768, "GTA IV/Graphics/Native Renderer",
+    "Host memory (MiB of MemAvailable) the host budget and memory warnings keep free")
+    .range(0, 65536);
+REXCVAR_DEFINE_UINT32(
+    gta4_native_host_memory_grace_frames, 120, "GTA IV/Graphics/Native Renderer",
+    "Frames without use before a texture may be retired under host budget pressure")
+    .range(1, 600);
+REXCVAR_DEFINE_BOOL(
+    gta4_native_host_memory_warnings, false, "GTA IV/Graphics/Native Renderer",
+    "Raise renderer memory warnings from Linux PSI (/proc/pressure/memory) or MemAvailable "
+    "below the reserve; acted on only with THEFT4_MEMORY_RECOVERY=1");
+REXCVAR_DEFINE_DOUBLE(
+    gta4_native_host_memory_psi_percent, 10.0, "GTA IV/Graphics/Native Renderer",
+    "Memory PSI 'some avg10' percentage that counts as host memory pressure")
+    .range(0.1, 100.0);
 
 namespace rex::graphics::gta4_native {
 
@@ -1020,6 +1042,9 @@ bool NativeFrameAssemblyEnabled() {
     return !setting || std::strcmp(setting, "0") != 0;
   }();
   return enabled;
+#elif defined(THEFT4_LAB_BUILD) && defined(__linux__)
+  static const bool enabled = NativeLinuxSwitchRequested("THEFT4_FRAME_ASSEMBLY");
+  return enabled;
 #else
   return false;
 #endif
@@ -1058,9 +1083,6 @@ bool NativeMemoryRecoveryEnabled() {
     const char* setting = std::getenv("THEFT4_MEMORY_RECOVERY");
     return !setting || std::strcmp(setting, "0") != 0;
   }();
-  return enabled;
-#elif defined(THEFT4_LAB_BUILD) && defined(__linux__)
-  static const bool enabled = NativeLinuxSwitchRequested("THEFT4_FRAME_ASSEMBLY");
   return enabled;
 #else
   return false;
@@ -18080,11 +18102,12 @@ Gta4NativeGraphicsSystem::QueryNativeTextureHeapBudgets() const {
       vulkan_device ? vulkan_device->vulkan_instance() : nullptr;
   if (!vulkan_device || !vulkan_instance || !vulkan_device->extensions().ext_EXT_memory_budget ||
       !vulkan_instance->extensions().ext_1_1_KHR_get_physical_device_properties2) {
-    return result;
+    return vulkan_device && REXCVAR_GET(gta4_native_host_memory_budget)
+        ? QueryHostTextureHeapBudgets() : result;
   }
   const auto& ifn = vulkan_instance->functions();
   if (!ifn.vkGetPhysicalDeviceMemoryProperties2) {
-    return result;
+    return REXCVAR_GET(gta4_native_host_memory_budget) ? QueryHostTextureHeapBudgets() : result;
   }
   VkPhysicalDeviceMemoryBudgetPropertiesEXT budget_properties{};
   budget_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
@@ -18100,6 +18123,56 @@ Gta4NativeGraphicsSystem::QueryNativeTextureHeapBudgets() const {
     result.budget[heap] = budget_properties.heapBudget[heap];
   }
   return result;
+}
+
+// Honeykrisp exposes one unified heap and no VK_EXT_memory_budget. Treat the
+// renderer's own texture bytes as usage and grant what the host can still give
+// above the reserve, so the 90%/85% pressure thresholds track host headroom.
+Gta4NativeGraphicsSystem::NativeTextureHeapBudgets
+Gta4NativeGraphicsSystem::QueryHostTextureHeapBudgets() const {
+  NativeTextureHeapBudgets result{};
+  const auto host = SampleNativeHostMemory();
+  auto* vulkan_provider = static_cast<ui::vulkan::VulkanProvider*>(provider_.get());
+  const ui::vulkan::VulkanDevice* vulkan_device =
+      vulkan_provider ? vulkan_provider->vulkan_device() : nullptr;
+  if (!host.mem_available_valid || !vulkan_device) return result;
+  VkPhysicalDeviceMemoryProperties properties{};
+  vulkan_device->vulkan_instance()->functions().vkGetPhysicalDeviceMemoryProperties(
+      vulkan_device->physical_device(), &properties);
+  auto usage = accounted_texture_bytes_;
+  for (const auto& pooled : texture_allocation_pool_.entries())
+    if (pooled.allocation.memory_heap < usage.size()) usage[pooled.allocation.memory_heap] += pooled.bytes;
+  const uint64_t reserve = uint64_t(REXCVAR_GET(gta4_native_host_memory_reserve_mb)) * 1048576ull;
+  result.available = true;
+  result.host_fallback = true;
+  result.heap_count = std::min(properties.memoryHeapCount, uint32_t(VK_MAX_MEMORY_HEAPS));
+  for (uint32_t heap = 0; heap < result.heap_count; ++heap) {
+    result.usage[heap] = usage[heap];
+    result.budget[heap] = NativeHostTextureBudget(properties.memoryHeaps[heap].size, usage[heap],
+                                                  host.mem_available_bytes, reserve, 75);
+  }
+  return result;
+}
+
+void Gta4NativeGraphicsSystem::PollHostMemoryPressure(uint32_t frame) {
+  if (!REXCVAR_GET(gta4_native_host_memory_warnings) ||
+      !host_memory_poll_schedule_.ShouldRun(frame, 30)) return;
+  const auto host = SampleNativeHostMemory();
+  const uint64_t reserve = uint64_t(REXCVAR_GET(gta4_native_host_memory_reserve_mb)) * 1048576ull;
+  const bool low_available = host.mem_available_valid && host.mem_available_bytes < reserve;
+  const bool stalled = host.psi_valid &&
+      host.psi_some_avg10 >= REXCVAR_GET(gta4_native_host_memory_psi_percent);
+  if (!low_available && !stalled) return;
+  // One request per 600 frames: recovery itself runs for 120 title presents,
+  // and PSI avg10 decays over ten seconds after the trim relieves the host.
+  if (host_memory_warning_sent_ && frame >= host_memory_warning_frame_ &&
+      frame - host_memory_warning_frame_ < 600) return;
+  host_memory_warning_sent_ = true;
+  host_memory_warning_frame_ = frame;
+  light::memory_warnings.fetch_add(1, std::memory_order_relaxed);
+  REXLOG_INFO("gta4-native-memory: host pressure frame={} mem-available-mib={} psi-some-avg10={:.2f} "
+              "recovery={}", frame, host.mem_available_bytes / 1048576, host.psi_some_avg10,
+              NativeMemoryRecoveryEnabled());
 }
 
 void Gta4NativeGraphicsSystem::DestroyNativeTextureImage(NativeTextureImage& image) {
@@ -20446,6 +20519,7 @@ void Gta4NativeGraphicsSystem::EvictNativeTextureImages(uint32_t submitted_frame
   // cache permanently under pressure and recreate textures continuously.
   if (configured_limit_bytes) {
     budgets.available = true;
+    budgets.host_fallback = false;
     budgets.heap_count = native_texture_heap_count;
     budgets.usage = native_texture_usage;
     for (uint32_t heap = 0; heap < budgets.heap_count; ++heap) {
@@ -20473,6 +20547,13 @@ void Gta4NativeGraphicsSystem::EvictNativeTextureImages(uint32_t submitted_frame
     }
     texture_budget_pressure_active_ = pressure_after_poll;
   }
+  // Driver budgets only reorder aged candidates under pressure. A host-derived
+  // budget means the system itself is short of memory, so it also shortens the
+  // age at which unreferenced textures may be retired.
+  const uint32_t grace_frames = ios_pressure ? 60
+      : budgets.host_fallback && texture_budget_pressure_active_
+          ? REXCVAR_GET(gta4_native_host_memory_grace_frames)
+          : kNativeTextureCacheRetentionFrames;
 
   std::vector<Candidate> candidates;
   auto consider = [&](uint64_t generation, const NativeTextureImage* image) {
@@ -20480,7 +20561,7 @@ void Gta4NativeGraphicsSystem::EvictNativeTextureImages(uint32_t submitted_frame
         !CanDiscardNativeTextureImageContents(image->source->gpu_produced, !image->source->payload.empty()) ||
         protected_texture_generations_.contains(generation)) return;
     if (!allocation_recovery && !ShouldEvictNativeTextureCandidate(false, true, submitted_frame,
-          image->last_used_frame, ios_pressure ? 60 : kNativeTextureCacheRetentionFrames)) return;
+          image->last_used_frame, grace_frames)) return;
     if (ios_pressure && !allocation_recovery &&
         image->last_used_submission > completed_command_buffer_submission_) return;
     candidates.push_back({{image->last_use_serial, generation}, image->memory_heap, image->allocation_size});
@@ -20545,8 +20626,7 @@ void Gta4NativeGraphicsSystem::EvictNativeTextureImages(uint32_t submitted_frame
                                        budgets.budget[candidate.memory_heap]));
       if (!allocation_recovery &&
           !ShouldEvictNativeTextureCandidate(false, budget_pressure, submitted_frame,
-                                             image->second->last_used_frame,
-                                             ios_pressure ? 60 : kNativeTextureCacheRetentionFrames)) {
+                                             image->second->last_used_frame, grace_frames)) {
         continue;
       }
 
@@ -37256,6 +37336,7 @@ bool Gta4NativeGraphicsSystem::ClearGuestOutput(
             tv_lifecycle_trace_->run, submitted_frame, present.device != 0,
             active_texture_frame_, resource_frame));
         active_texture_frame_ = resource_frame;
+        PollHostMemoryPressure(resource_frame);
         BeginMemoryPressureRecovery(resource_frame, present.device != 0);
         ReleasePendingSurfaceImages();
         finish_housekeeping_stage(performance::CpuRange::kHousekeepingSurfaceRelease);
