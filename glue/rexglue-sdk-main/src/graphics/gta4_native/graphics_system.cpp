@@ -1124,6 +1124,14 @@ thread_local std::array<uint64_t, rex::graphics::gta4_native::performance::kCoun
 namespace transition = rex::diagnostics::gta4_transition;
 namespace gpu_flight = rex::diagnostics::gpu_flight;
 
+// The flight recorder is enabled from the environment when first constructed,
+// before the renderer starts. Cache it: per-command and per-draw paths would
+// otherwise make a cross-library call even when it is off.
+bool NativeGpuFlightEnabled() {
+  static const bool enabled = gpu_flight::IsEnabled();
+  return enabled;
+}
+
 #if defined(THEFT4_LAB_BUILD) && defined(__APPLE__) && defined(__MACH__)
 // This uses the kernel's cumulative per-thread CPU accounting. Unlike the
 // profiler's host-clock spans, it excludes time while this worker is runnable
@@ -1191,8 +1199,11 @@ constexpr uint64_t kNativeFenceWaitNanoseconds = UINT64_MAX;
 #endif
 
 bool IsNativeFlightVerboseLoggingEnabled() {
-  return rex::diagnostics::IsEnabled(rex::diagnostics::Category::kNativeTrace) ||
-         rex::diagnostics::IsEnabled(rex::diagnostics::Category::kVulkan);
+  // The diagnostics policy is installed before any worker thread starts.
+  static const bool enabled =
+      rex::diagnostics::IsEnabled(rex::diagnostics::Category::kNativeTrace) ||
+      rex::diagnostics::IsEnabled(rex::diagnostics::Category::kVulkan);
+  return enabled;
 }
 
 bool IsDeferredLightShaderFilename(std::string_view filename) {
@@ -4209,7 +4220,7 @@ void Gta4NativeGraphicsSystem::PublishDeferredNativeTrace() {
 }
 
 bool Gta4NativeGraphicsSystem::IsNativeFlightRecorderEnabled() const {
-  return gpu_flight::IsEnabled() || IsNativeFlightVerboseLoggingEnabled();
+  return NativeGpuFlightEnabled() || IsNativeFlightVerboseLoggingEnabled();
 }
 
 void Gta4NativeGraphicsSystem::StageNativeFlightResource(NativeFlightResourceKind kind,
@@ -9783,9 +9794,10 @@ bool Gta4NativeGraphicsSystem::GetOrCreatePersistentBuffer(
     allocation.host_data = source;
     StageNativeFlightResource(NativeFlightResourceKind::kPersistentBuffer,
                               NativeVulkanHandleIdentity(cached_entry->buffer), 0, key.generation);
-    gpu_flight::Record("native.persistent-reuse", NativeVulkanHandleIdentity(cached_entry->buffer),
-                       predicted_submission, active_texture_frame_, cached_entry->offset,
-                       cached_entry->size);
+    if (NativeGpuFlightEnabled())
+      gpu_flight::Record("native.persistent-reuse", NativeVulkanHandleIdentity(cached_entry->buffer),
+                         predicted_submission, active_texture_frame_, cached_entry->offset,
+                         cached_entry->size);
     if(development_diagnostics_)++persistent_buffer_hits_;
     AddNativeGpuProfileCounter(performance::Counter::kPersistentBufferHits);
     AddNativeGpuProfileCounter(performance::Counter::kPersistentBufferOwnerMemoHits,
@@ -19606,9 +19618,11 @@ bool Gta4NativeGraphicsSystem::PrepareFrameTextures(VkCommandBuffer command_buff
   null_descriptor_key.images_3d.fill(null_texture_3d_.view);
   null_descriptor_key.images_cube.fill(null_texture_cube_.view);
   null_descriptor_key.samplers.fill(null_sampler_);
+  // Read the string cvar once per frame, not per draw.
+  const bool room_light_probe = REXCVAR_GET(gta4_native_light_color_delta_probe) == "room";
   const bool reuse_prepared_bindings = !trace_reflections && !FireTraceConfig().enabled &&
       !EmissionTraceConfig().pipeline_full_readback && !PhoneTraceConfig().enabled &&
-      REXCVAR_GET(gta4_native_light_color_delta_probe) != "room" &&
+      !room_light_probe &&
       !rex::diagnostics::IsEnabled(rex::diagnostics::Category::kNativeTranslucency);
 
   const profile::CpuPhaseScope profile_phase(profile::CpuPhase::kTextures);
@@ -19786,7 +19800,7 @@ bool Gta4NativeGraphicsSystem::PrepareFrameTextures(VkCommandBuffer command_buff
     const bool capture_fire_bindings = FireTraceConfig().enabled &&
         (command.fire_trace || submitted_frame % FireTraceConfig().interval == 0);
     if (capture_fire_bindings || capture_bulb_bindings || TvCommandRole(command) || (PhoneTraceConfig().lineage && command.phone_trace) ||
-        (REXCVAR_GET(gta4_native_light_color_delta_probe) == "room" && !room_light_probe_stop_requested_ &&
+        (room_light_probe && !room_light_probe_stop_requested_ &&
          command.pipeline_state && command.pipeline_state->pixel_shader_resource &&
          IsDeferredLightShaderFilename(command.pipeline_state->pixel_shader_resource->filename))) {
       command.room_light_input_bindings =
@@ -23610,7 +23624,7 @@ bool Gta4NativeGraphicsSystem::BindCommonDrawState(
       command.pipeline_state && command.pipeline_state->vertex_shader_resource
           ? command.pipeline_state->vertex_shader_resource->hash
           : 0;
-  if (gpu_flight::IsEnabled()) {
+  if (NativeGpuFlightEnabled()) {
     const uint64_t submission = submission_tracker_ ? submission_tracker_->GetCurrentSubmission() : 0;
     gpu_flight::Record("native.draw-pipeline", NativeVulkanHandleIdentity(pipeline), submission,
                        diagnostic_submitted_frame_, diagnostic_command_index_,
@@ -31514,9 +31528,10 @@ bool Gta4NativeGraphicsSystem::RecordNativeFrame(
     }
     diagnostic_submitted_frame_ = submitted_frame;
     diagnostic_command_index_ = command_index;
-    gpu_flight::Record("native.command", NativeVulkanHandleIdentity(command_buffer),
-                       submission_tracker_ ? submission_tracker_->GetCurrentSubmission() : 0,
-                       submitted_frame, command_index, uint64_t(command.type));
+    if (NativeGpuFlightEnabled())
+      gpu_flight::Record("native.command", NativeVulkanHandleIdentity(command_buffer),
+                         submission_tracker_ ? submission_tracker_->GetCurrentSubmission() : 0,
+                         submitted_frame, command_index, uint64_t(command.type));
     diagnostic_render_phase_ = command.render_phase;
     diagnostic_render_phase_object_ = command.render_phase_object;
     fire_event_active_ = fire_frame_ && (command.fire_trace || command.type == CommandType::kResolve ||
