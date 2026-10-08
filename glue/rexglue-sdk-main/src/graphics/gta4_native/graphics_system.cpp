@@ -9967,6 +9967,9 @@ bool Gta4NativeGraphicsSystem::EnsureFrameConstantArenaCapacity() {
   }
 
   const bool masked_enabled = NativeMaskedConstantsEnabled();
+  // The masked walk visits exactly the draws the capacity check counts; keep
+  // its count so the fast path below need not walk the frame again.
+  VkDeviceSize masked_draw_count = 0;
   if (masked_enabled) {
     for (const NativeCommand& command : current_frame_) {
       const bool is_draw = command.type == CommandType::kDrawPrimitive ||
@@ -9974,6 +9977,7 @@ bool Gta4NativeGraphicsSystem::EnsureFrameConstantArenaCapacity() {
                            command.type == CommandType::kDrawIndexedPrimitive;
       if (!is_draw || !command.shader_state || !command.shader_state->vertex_constants ||
           !command.shader_state->pixel_constants) continue;
+      ++masked_draw_count;
       NativeConstantUsage usage;
       if (command.pipeline_state && command.pipeline_state->vertex_shader_resource) {
         usage = command.pipeline_state->vertex_shader_resource->constant_usage;
@@ -10003,14 +10007,16 @@ bool Gta4NativeGraphicsSystem::EnsureFrameConstantArenaCapacity() {
     };
     constexpr VkDeviceSize worst_case_draw = aligned(kVertexConstantsSize) +
         aligned(kPixelConstantsSize) + aligned(sizeof(NativeSharedConstants));
-    VkDeviceSize draw_count = 0;
-    for (const NativeCommand& command : current_frame_) {
-      const bool is_draw = command.type == CommandType::kDrawPrimitive ||
-                           command.type == CommandType::kDrawPrimitiveUp ||
-                           command.type == CommandType::kDrawIndexedPrimitive;
-      draw_count += is_draw && command.shader_state &&
-                    command.shader_state->vertex_constants &&
-                    command.shader_state->pixel_constants;
+    VkDeviceSize draw_count = masked_draw_count;
+    if (!masked_enabled) {
+      for (const NativeCommand& command : current_frame_) {
+        const bool is_draw = command.type == CommandType::kDrawPrimitive ||
+                             command.type == CommandType::kDrawPrimitiveUp ||
+                             command.type == CommandType::kDrawIndexedPrimitive;
+        draw_count += is_draw && command.shader_state &&
+                      command.shader_state->vertex_constants &&
+                      command.shader_state->pixel_constants;
+      }
     }
     const VkDeviceSize extra = NativeGraphicsPreparationEnabled() && draw_count
         ? aligned(kVertexConstantsSize) : 0;
