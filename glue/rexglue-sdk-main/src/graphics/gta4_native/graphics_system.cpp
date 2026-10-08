@@ -429,6 +429,10 @@ REXCVAR_DEFINE_BOOL(
     "persistent vertex/index buffers (filled through their own mapping, as on MoltenVK), and "
     "check each bound texture once per frame");
 REXCVAR_DEFINE_BOOL(
+    gta4_native_skip_identity_restart_rewrite, false, "GTA IV/Graphics/Native Renderer",
+    "Bind 16-bit strip indices directly when the guest restart index is already 0xFFFF instead "
+    "of copying them through frame staging every draw");
+REXCVAR_DEFINE_BOOL(
     gta4_native_host_memory_budget, false, "GTA IV/Graphics/Native Renderer",
     "Without VK_EXT_memory_budget (Honeykrisp), derive the texture budget from host "
     "MemAvailable; under that pressure, textures unused for "
@@ -24859,7 +24863,12 @@ bool Gta4NativeGraphicsSystem::RecordIndexedPrimitive(VkCommandBuffer command_bu
     host_index_buffer = quad_list_indices.buffer;
     host_index_offset = quad_list_indices.offset;
   }
-  if (guest_restart_enabled) {
+  // 16-bit strips whose guest restart index is already 0xFFFF need no rewrite:
+  // it would copy every index unchanged into staging. Quad lists are never
+  // strips, so the selected bytes are still the uploaded buffer here.
+  const bool identity_restart = !index32 && draw.primitive_restart_index == UINT16_MAX &&
+      REXCVAR_GET(gta4_native_skip_identity_restart_rewrite);
+  if (guest_restart_enabled && !identity_restart) {
     const VkDeviceSize restart_size = VkDeviceSize(host_index_count) * element_size;
     if (!AllocateUpload(restart_size, size_t(element_size), primitive_restart_indices,
                         NativeUploadKind::kIndex)) {
