@@ -12,6 +12,7 @@ add_executable(unit_tests
     core/stream_test.cpp
     core/byte_order_test.cpp
     core/chrono_test.cpp
+    core/wait_multiple_test.cpp
     audio/audio_conversion_test.cpp
     audio/audio_ring_test.cpp
     audio/audio_clock_test.cpp
